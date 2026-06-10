@@ -1,0 +1,102 @@
+"""
+Second-stage login on authv2.flozic.ai (AWS Cognito Hosted UI).
+
+After the first-stage login at accounts.appypie.com succeeds, the OAuth
+flow may redirect to a Cognito-hosted login page at authv2.flozic.ai
+which prompts for username + password again on a two-step form:
+
+    1. Username input  (name="username", placeholder="Enter username")
+    2. Click 'Next' button
+    3. Password input  (name="password", placeholder="Enter password")
+    4. Click 'Continue' button
+    5. Cognito redirects to connectcloud.appypie.com/auth/cognito/callback
+       which then takes the user to the destination (e.g. /customeditor).
+
+Selectors:
+  The AWS UI library (awsui_*) ships hashed CSS class suffixes that change
+  between deployments. Use stable attributes: input[name=...] and the
+  visible button text instead of awsui_* class names.
+
+This is described by the user as a temporary interface, so we keep it
+isolated in its own helper to be easy to remove later.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
+
+from pages.auth_helper import DEFAULT_EMAIL, DEFAULT_PASSWORD
+
+logger = logging.getLogger(__name__)
+
+AUTHV2_HOST_FRAGMENT = "authv2.flozic.ai"
+
+
+def is_on_authv2(page: Page) -> bool:
+    """True when the current URL is on the authv2.flozic.ai Cognito host."""
+    return AUTHV2_HOST_FRAGMENT in (page.url or "")
+
+
+def handle_authv2_login_if_present(
+    page: Page,
+    email: str = DEFAULT_EMAIL,
+    password: str = DEFAULT_PASSWORD,
+    settle_timeout_ms: int = 8_000,
+    step_timeout_ms: int = 20_000,
+) -> bool:
+    """
+    If the page is currently on authv2.flozic.ai (or navigates there shortly),
+    complete the two-step login form.
+
+    Returns True if the authv2 login was performed, False if the page was
+    not on authv2 within `settle_timeout_ms` (which is normal for accounts
+    that don't need the second-stage handshake).
+
+    The caller is responsible for waiting for the final destination URL
+    after this returns (e.g. /customeditor).
+    """
+    # Give the OAuth redirect a moment to land on authv2 if it's going to.
+    try:
+        page.wait_for_url(f"**{AUTHV2_HOST_FRAGMENT}**", timeout=settle_timeout_ms)
+    except PlaywrightTimeoutError:
+        if not is_on_authv2(page):
+            logger.info("Not on authv2 (URL=%s) — skipping second-stage login.", page.url)
+            return False
+
+    logger.info("On authv2 Cognito login (%s). Submitting credentials.", page.url)
+
+    # ── Step 1: username ─────────────────────────────────────────────────────
+    username_field = page.locator("input[name='username']").first
+    username_field.wait_for(state="visible", timeout=step_timeout_ms)
+    username_field.click()
+    username_field.fill(email)
+    logger.info("[authv2] Username entered.")
+
+    # ── Step 2: Next button ──────────────────────────────────────────────────
+    next_btn = page.locator(
+        "button[type='submit']:has-text('Next')"
+    ).first
+    next_btn.wait_for(state="visible", timeout=step_timeout_ms)
+    next_btn.click()
+    logger.info("[authv2] Next clicked.")
+
+    # ── Step 3: password ─────────────────────────────────────────────────────
+    # The password field is rendered after Cognito acknowledges the username,
+    # which can take a network round-trip. Allow ample time.
+    password_field = page.locator("input[name='password']").first
+    password_field.wait_for(state="visible", timeout=step_timeout_ms)
+    password_field.click()
+    password_field.fill(password)
+    logger.info("[authv2] Password entered.")
+
+    # ── Step 4: Continue button ──────────────────────────────────────────────
+    continue_btn = page.locator(
+        "button[type='submit']:has-text('Continue')"
+    ).first
+    continue_btn.wait_for(state="visible", timeout=step_timeout_ms)
+    continue_btn.click()
+    logger.info("[authv2] Continue clicked. Cognito will redirect to the callback URL.")
+
+    return True

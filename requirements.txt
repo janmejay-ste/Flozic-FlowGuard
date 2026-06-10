@@ -1,0 +1,7 @@
+playwright>=1.49.0
+pytest>=8.3.0
+pytest-xdist>=3.6.0
+
+# Optional: PDF report generation (requires GTK+ on Windows — see docs/pdf-setup.md)
+# Install with: pip install weasyprint
+# weasyprint>=62.3

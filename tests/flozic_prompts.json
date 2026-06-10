@@ -1,0 +1,53 @@
+{
+  "_comment": "Prompts used for flozic.ai entry-point connect creation tests. Each app has a URL slug, a prompt to type into the textarea, and expected substrings that should appear in the copilot 'Connect created!' message after auto-build.",
+  "google-sheets": {
+    "url_slug": "google-sheets",
+    "prompt": "When a new row is added to my Google Sheet, create a HubSpot contact with the mapped fields and post a summary to my Slack sales channel.",
+    "expected_trigger": "Google Sheets"
+  },
+  "gohighlevel": {
+    "url_slug": "gohighlevel",
+    "prompt": "When a new opportunity is created in GoHighLevel V2, create a sale in Mindbody with the contact details.",
+    "expected_trigger": "GoHighLevel"
+  },
+  "cliniko": {
+    "url_slug": "cliniko",
+    "prompt": "When a new patient is added in Cliniko, send a welcome email via Gmail and add the contact to HubSpot.",
+    "expected_trigger": "Cliniko"
+  },
+  "chatgpt": {
+    "url_slug": "chatgpt",
+    "prompt": "When a new Gmail email arrives, summarize it with ChatGPT and post the summary to a Slack channel.",
+    "expected_trigger": "Gmail"
+  },
+  "housecall-pro": {
+    "url_slug": "housecall-pro",
+    "prompt": "When a new job is scheduled in Housecall Pro, add it to Google Calendar and notify the team in Slack.",
+    "expected_trigger": "Housecall Pro"
+  },
+  "microsoft-excel": {
+    "url_slug": "microsoft-excel",
+    "prompt": "When a new row is added in Microsoft Excel, create a Trello card and email the assignee via Gmail.",
+    "expected_trigger": "Microsoft Excel"
+  },
+  "telegram": {
+    "url_slug": "telegram",
+    "prompt": "When a new message is received in Telegram, summarize it with ChatGPT and save the result to Google Sheets.",
+    "expected_trigger": "Telegram"
+  },
+  "mindbody": {
+    "url_slug": "mindbody",
+    "prompt": "When a new client is added in Mindbody, create a contact in HubSpot and send a welcome email via Gmail.",
+    "expected_trigger": "Mindbody"
+  },
+  "gmail": {
+    "url_slug": "gmail",
+    "prompt": "When a new starred email arrives in Gmail, create a task in Trello and notify the team in Slack.",
+    "expected_trigger": "Gmail"
+  },
+  "paypal": {
+    "url_slug": "paypal",
+    "prompt": "When a new PayPal payment is received, log it in Google Sheets and post a notification to Slack.",
+    "expected_trigger": "PayPal"
+  }
+}

@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Playwright artifacts (regenerated each run)
+test-results/
+playwright-report/
+
+# Runtime reports (regenerated each run)
+reports/
+
+# Local environment overrides
+.env
+.env.local
+
+# GPT prompt cache (regeneratable; key = slug + n + model)
+cache/
+
+# NOTE: baselines/ is intentionally NOT ignored — visual-regression
+# baselines must live in version control as historical truth.
+# Promote with: python scripts/promote_baseline.py <test_id>
