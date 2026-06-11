@@ -486,8 +486,20 @@ def _render_test_rows(
                 cluster.recurring_score,
             )
         ai_details = _ai_details_block(r)
+        # data-* attributes drive the client-side filter / search / sort.
+        # data-search is a lowercased haystack of every searchable field.
+        search_blob = " ".join([
+            r.method, r.feature, r.category, r.status,
+        ]).lower().replace("'", " ")
         rows.append(
-            f"<tr style='background:{bg}'>"
+            f"<tr class='tr-row' "
+            f"data-status='{r.status}' "
+            f"data-feature='{_html_attr(r.feature)}' "
+            f"data-category='{_html_attr(r.category)}' "
+            f"data-duration='{r.duration_ms}' "
+            f"data-method='{_html_attr(r.method)}' "
+            f"data-search='{_html_attr(search_blob)}' "
+            f"style='background:{bg}'>"
             f"<td style='padding:8px 12px;font-size:13px;font-family:monospace;vertical-align:top;'>"
             f"<div>{r.method}</div>{ai_details}</td>"
             f"<td style='padding:8px 12px;font-size:12px;color:#64748b;vertical-align:top;'>{r.feature}</td>"
@@ -498,6 +510,249 @@ def _render_test_rows(
             f"</tr>"
         )
     return "\n".join(rows)
+
+
+def _html_attr(s: str) -> str:
+    """Escape a string for safe use inside a single-quoted HTML attribute."""
+    return (str(s or "")
+            .replace("&", "&amp;").replace("'", "&#39;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _render_test_results_toolbar(records: list[TestRecord]) -> str:
+    """
+    Toolbar above the Test Results table: status filter, feature filter,
+    category filter, and a search box. All client-side (see _filter_sort_script).
+    """
+    features   = sorted({r.feature for r in records if r.feature})
+    categories = sorted({r.category for r in records if r.category})
+    statuses   = ["PASS", "FAIL", "SKIP"]
+
+    def _opts(values: list[str], label: str) -> str:
+        opts = f"<option value=''>{label}</option>"
+        opts += "".join(f"<option value='{_html_attr(v)}'>{v}</option>" for v in values)
+        return opts
+
+    sel_style = (
+        "font-size:12px;padding:5px 8px;border-radius:6px;border:1px solid #cbd5e1;"
+        "background:#fff;color:#1e293b;cursor:pointer;"
+    )
+    return f"""
+    <div class="no-print" style="display:flex;gap:8px;align-items:center;
+                flex-wrap:wrap;margin-bottom:12px;">
+      <input id="tr-search" type="text" placeholder="🔎 Search tests…"
+             oninput="filterTestRows()"
+             style="font-size:12px;padding:6px 10px;border-radius:6px;
+                    border:1px solid #cbd5e1;min-width:220px;flex:1;max-width:340px;">
+      <select id="tr-status" onchange="filterTestRows()" style="{sel_style}">
+        {_opts(statuses, 'All statuses')}
+      </select>
+      <select id="tr-feature" onchange="filterTestRows()" style="{sel_style}">
+        {_opts(features, 'All features')}
+      </select>
+      <select id="tr-category" onchange="filterTestRows()" style="{sel_style}">
+        {_opts(categories, 'All categories')}
+      </select>
+      <button onclick="resetTestFilters()" style="{sel_style}font-weight:600;">
+        ✕ Clear
+      </button>
+      <span id="tr-count" style="font-size:11px;color:#64748b;margin-left:auto;"></span>
+    </div>
+    """
+
+
+def _filter_sort_script() -> str:
+    """
+    Client-side filter / search / sort for the Test Results table, plus the
+    auto-refresh toggle. Pure vanilla JS, no deps. Returned as a plain string
+    (NOT an f-string) so the JS braces don't need escaping.
+    """
+    return """
+    <script>
+    (function () {
+      // ── Filter + search ──────────────────────────────────────────────
+      window.filterTestRows = function () {
+        var q    = (document.getElementById('tr-search')   || {}).value || '';
+        var st   = (document.getElementById('tr-status')   || {}).value || '';
+        var feat = (document.getElementById('tr-feature')  || {}).value || '';
+        var cat  = (document.getElementById('tr-category') || {}).value || '';
+        q = q.trim().toLowerCase();
+        var rows = document.querySelectorAll('#test-results-body .tr-row');
+        var shown = 0;
+        rows.forEach(function (row) {
+          var okSearch = !q || (row.getAttribute('data-search') || '').indexOf(q) !== -1;
+          var okStatus = !st || row.getAttribute('data-status') === st;
+          var okFeat   = !feat || row.getAttribute('data-feature') === feat;
+          var okCat    = !cat || row.getAttribute('data-category') === cat;
+          var show = okSearch && okStatus && okFeat && okCat;
+          row.style.display = show ? '' : 'none';
+          if (show) shown++;
+        });
+        var count = document.getElementById('tr-count');
+        if (count) count.textContent = shown + ' of ' + rows.length + ' shown';
+        var empty = document.getElementById('tr-empty');
+        if (empty) empty.style.display = (shown === 0 && rows.length > 0) ? 'block' : 'none';
+      };
+
+      window.resetTestFilters = function () {
+        ['tr-search','tr-status','tr-feature','tr-category'].forEach(function (id) {
+          var el = document.getElementById(id);
+          if (el) el.value = '';
+        });
+        window.filterTestRows();
+      };
+
+      // ── Sort ─────────────────────────────────────────────────────────
+      var sortState = { key: null, dir: 1 };
+      window.sortTestTable = function (key, th) {
+        var body = document.getElementById('test-results-body');
+        if (!body) return;
+        // Toggle direction if same column clicked again.
+        if (sortState.key === key) { sortState.dir *= -1; }
+        else { sortState.key = key; sortState.dir = 1; }
+        var rows = Array.prototype.slice.call(body.querySelectorAll('.tr-row'));
+        rows.sort(function (a, b) {
+          var av = a.getAttribute('data-' + key) || '';
+          var bv = b.getAttribute('data-' + key) || '';
+          if (key === 'duration') {
+            av = parseFloat(av) || 0; bv = parseFloat(bv) || 0;
+            return (av - bv) * sortState.dir;
+          }
+          return av.toLowerCase().localeCompare(bv.toLowerCase()) * sortState.dir;
+        });
+        rows.forEach(function (r) { body.appendChild(r); });
+        // Update sort indicators
+        document.querySelectorAll('#test-results-table .sort-ind').forEach(function (s) {
+          s.textContent = '';
+        });
+        if (th) {
+          var ind = th.querySelector('.sort-ind');
+          if (ind) ind.textContent = sortState.dir === 1 ? ' ▲' : ' ▼';
+        }
+      };
+
+      // ── Auto-refresh ─────────────────────────────────────────────────
+      var autoTimer = null;
+      window.toggleAutoReload = function () {
+        var cb = document.getElementById('auto-reload-toggle');
+        try {
+          localStorage.setItem('flowguard-autoreload', cb && cb.checked ? '1' : '0');
+        } catch (e) {}
+        if (cb && cb.checked) {
+          autoTimer = setInterval(function () { location.reload(); }, 10000);
+        } else if (autoTimer) {
+          clearInterval(autoTimer); autoTimer = null;
+        }
+      };
+
+      // ── Root-cause drill-down (Issues table) ─────────────────────────
+      window.filterRootCause = function (rc, chip) {
+        var rows = document.querySelectorAll(
+          '#issues-table .issue-row, #issues-table .issue-row-details');
+        rows.forEach(function (row) {
+          var match = !rc || row.getAttribute('data-rootcause') === rc;
+          row.style.display = match ? '' : 'none';
+        });
+        // Highlight the active chip.
+        document.querySelectorAll('.rc-chip').forEach(function (c) {
+          c.style.outline = (c.getAttribute('data-rc') === rc) ? '2px solid #0f172a' : 'none';
+        });
+      };
+
+      // ── Collapsible sections (.card with a leading <h2>) ─────────────
+      function initCollapsibles() {
+        var cards = document.querySelectorAll('.card');
+        cards.forEach(function (card) {
+          var h2 = card.querySelector('h2');
+          if (!h2) return;
+          var key = 'flowguard-collapse-' + (h2.textContent || '').trim().slice(0, 40);
+          // Wrap everything after the h2 in a .collapse-body container.
+          var body = document.createElement('div');
+          body.className = 'collapse-body';
+          var sib = h2.nextSibling;
+          while (sib) { var next = sib.nextSibling; body.appendChild(sib); sib = next; }
+          card.appendChild(body);
+          // Caret + click handler.
+          var caret = document.createElement('span');
+          caret.className = 'collapse-caret';
+          caret.textContent = '▾ ';
+          h2.insertBefore(caret, h2.firstChild);
+          h2.classList.add('collapse-toggle');
+          h2.addEventListener('click', function () {
+            card.classList.toggle('section-collapsed');
+            try {
+              localStorage.setItem(key,
+                card.classList.contains('section-collapsed') ? '1' : '0');
+            } catch (e) {}
+          });
+          // Restore persisted state.
+          try {
+            if (localStorage.getItem(key) === '1') card.classList.add('section-collapsed');
+          } catch (e) {}
+        });
+      }
+
+      // ── Dark mode ────────────────────────────────────────────────────
+      window.toggleDarkMode = function () {
+        var on = document.body.classList.toggle('dark');
+        var label = document.getElementById('dark-mode-label');
+        if (label) label.textContent = on ? '☀️ Light' : '🌙 Dark';
+        try { localStorage.setItem('flowguard-dark', on ? '1' : '0'); } catch (e) {}
+      };
+
+      // ── Screenshot hover preview (any link to a .png) ────────────────
+      function initHoverPreview() {
+        var pop = document.createElement('div');
+        pop.id = 'hover-preview';
+        var img = document.createElement('img');
+        pop.appendChild(img);
+        document.body.appendChild(pop);
+        function isImg(a) {
+          var h = (a.getAttribute('href') || '').toLowerCase();
+          return h.indexOf('.png') !== -1 || h.indexOf('.jpg') !== -1
+              || h.indexOf('.jpeg') !== -1 || h.indexOf('.webp') !== -1;
+        }
+        document.addEventListener('mouseover', function (e) {
+          var a = e.target.closest ? e.target.closest('a') : null;
+          if (!a || !isImg(a)) return;
+          img.src = a.getAttribute('href');
+          pop.style.display = 'block';
+        });
+        document.addEventListener('mousemove', function (e) {
+          if (pop.style.display !== 'block') return;
+          var x = e.clientX + 18, y = e.clientY + 18;
+          // Keep within viewport.
+          if (x + 470 > window.innerWidth) x = e.clientX - 470;
+          if (y + 330 > window.innerHeight) y = window.innerHeight - 330;
+          pop.style.left = Math.max(4, x) + 'px';
+          pop.style.top  = Math.max(4, y) + 'px';
+        });
+        document.addEventListener('mouseout', function (e) {
+          var a = e.target.closest ? e.target.closest('a') : null;
+          if (a && isImg(a)) { pop.style.display = 'none'; img.src = ''; }
+        });
+      }
+
+      // Restore auto-refresh preference + init the count on load.
+      document.addEventListener('DOMContentLoaded', function () {
+        try {
+          if (localStorage.getItem('flowguard-autoreload') === '1') {
+            var cb = document.getElementById('auto-reload-toggle');
+            if (cb) { cb.checked = true; window.toggleAutoReload(); }
+          }
+          if (localStorage.getItem('flowguard-dark') === '1') {
+            document.body.classList.add('dark');
+            var label = document.getElementById('dark-mode-label');
+            if (label) label.textContent = '☀️ Light';
+          }
+        } catch (e) {}
+        initCollapsibles();
+        initHoverPreview();
+        if (window.filterTestRows) window.filterTestRows();
+      });
+    })();
+    </script>
+    """
 
 
 def _tsv_escape(s: str) -> str:
@@ -570,6 +825,27 @@ def _render_issues_section(records: list[TestRecord]) -> str:
         "| " + " | ".join(tsv_cols) + " |",
         "| " + " | ".join(["---"] * len(tsv_cols)) + " |",
     ]
+    # Rich-text (HTML) table accumulator. This is what makes the paste
+    # render as a real table in Word / Outlook / Notion / Gmail / Confluence
+    # / most chat apps — anywhere that accepts the clipboard's text/html
+    # mime type. Inline styles are required (no external CSS reaches the
+    # destination's renderer).
+    import html as _html_mod
+    def _h(s: str) -> str:
+        return _html_mod.escape(str(s or ""))
+    html_rows: list[str] = [
+        "<tr style='background:#fee2e2;'>"
+        + "".join(
+            f"<th style='border:1px solid #cbd5e1;padding:6px 10px;"
+            f"font-family:Arial,sans-serif;font-size:12px;color:#7f1d1d;"
+            f"text-align:left;'>{_h(c)}</th>"
+            for c in tsv_cols
+        )
+        + "</tr>"
+    ]
+
+    # Root-cause counts for the drill-down summary chips.
+    rootcause_counts: dict[str, int] = {}
 
     # Build rows
     body_html: list[str] = []
@@ -609,13 +885,16 @@ def _render_issues_section(records: list[TestRecord]) -> str:
             "<span style='color:#94a3b8;font-size:11px;'>—</span>"
         )
 
-        # Triage badge
+        # Triage badge + root-cause bucket for the drill-down summary.
         triage_html = ""
+        rootcause = "UNCLASSIFIED"
         if triage.get("status") == "TRIAGED":
+            rootcause = str(triage.get("category", "UNKNOWN"))
             triage_html = _triage_badge(
-                str(triage.get("category", "UNKNOWN")),
+                rootcause,
                 str(triage.get("severity", "minor")),
             )
+        rootcause_counts[rootcause] = rootcause_counts.get(rootcause, 0) + 1
 
         # Links: 📷 Screenshot, 🩺 Triage, 🔗 URL, ▶ Replay
         rec_dir  = _recording_dir_for(r)
@@ -703,10 +982,17 @@ def _render_issues_section(records: list[TestRecord]) -> str:
         # Column separator style — light border on the right edge of every
         # column except the last gives the "|" delimiter look the user asked
         # for. Inline so it inherits cleanly with the existing styling.
-        SEP = "border-right:1px solid #fecaca;"
+        # Excel-style cell border on ALL four sides, in the section's red
+        # theme so it stays visible against the pink row background.
+        # (The global table th/td rule paints a light-grey grid by default,
+        # but that washes out on #fef2f2 — explicit override here.)
+        SEP = "border:1px solid #fecaca;"
         # Two rows per issue: data row + details row spanning all columns.
+        # data-rootcause lets the drill-down chips filter; the matching
+        # details row carries the same attribute so the pair hides together.
         body_html.append(
-            "<tr style='background:#fef2f2;border-top:1px solid #fecaca;'>"
+            f"<tr class='issue-row' data-rootcause='{_html_attr(rootcause)}' "
+            "style='background:#fef2f2;border-top:1px solid #fecaca;'>"
             f"<td style='padding:8px 10px;font-size:12px;font-family:monospace;"
             f"vertical-align:top;word-break:break-word;{SEP}'>{r.method}</td>"
             f"<td style='padding:8px 10px;font-size:11px;color:#64748b;vertical-align:top;{SEP}'>{r.category}</td>"
@@ -718,13 +1004,15 @@ def _render_issues_section(records: list[TestRecord]) -> str:
             f"max-width:240px;{SEP}'>{built_text}</td>"
             f"<td style='padding:8px 10px;vertical-align:top;white-space:nowrap;{SEP}'>"
             f"{triage_html}{verdict_html}</td>"
-            f"<td style='padding:8px 10px;vertical-align:top;white-space:nowrap;font-size:13px;'>{links_html}</td>"
+            f"<td style='padding:8px 10px;vertical-align:top;white-space:nowrap;font-size:13px;{SEP}'>{links_html}</td>"
             "</tr>"
         )
         if details_html:
             body_html.append(
-                f"<tr style='background:#fff5f5;'>"
-                f"<td colspan='8' style='padding:6px 14px 12px 14px;border-top:1px dashed #fecaca;'>"
+                f"<tr class='issue-row-details' data-rootcause='{_html_attr(rootcause)}' "
+                f"style='background:#fff5f5;'>"
+                f"<td colspan='8' style='padding:6px 14px 12px 14px;"
+                f"border:1px solid #fecaca;border-top:1px dashed #fecaca;'>"
                 f"{details_html}</td></tr>"
             )
 
@@ -760,6 +1048,18 @@ def _render_issues_section(records: list[TestRecord]) -> str:
         ]
         tsv_rows.append("\t".join(_tsv_escape(c) for c in tsv_cells))
         md_rows.append("| " + " | ".join(_md_escape(c) for c in tsv_cells) + " |")
+        # HTML row — inline styles so the table survives the clipboard
+        # journey and renders as a real table in the destination app.
+        html_rows.append(
+            "<tr>"
+            + "".join(
+                f"<td style='border:1px solid #cbd5e1;padding:6px 10px;"
+                f"font-family:Arial,sans-serif;font-size:11px;vertical-align:top;'>"
+                f"{_h(c)}</td>"
+                for c in tsv_cells
+            )
+            + "</tr>"
+        )
 
     header_cols = [
         ("Test",          "left"),
@@ -771,77 +1071,155 @@ def _render_issues_section(records: list[TestRecord]) -> str:
         ("Verdict",       "left"),
         ("Links",         "left"),
     ]
-    last_idx = len(header_cols) - 1
+    # Every header cell gets a full Excel-style border in the section's red
+    # theme. Background is slightly darker than rows so the header is visually
+    # distinct (same idea as Excel freezing the first row).
     head = (
-        "<tr style='background:#f8fafc;'>"
+        "<tr style='background:#fee2e2;'>"
         + "".join(
             f"<th style='text-align:{align};padding:8px 10px;font-size:11px;"
-            f"color:#64748b;font-weight:600;text-transform:uppercase;"
-            f"letter-spacing:0.5px;"
-            + ("" if i == last_idx else "border-right:1px solid #fecaca;")
-            + f"'>{label}</th>"
-            for i, (label, align) in enumerate(header_cols)
+            f"color:#7f1d1d;font-weight:700;text-transform:uppercase;"
+            f"letter-spacing:0.5px;border:1px solid #fecaca;"
+            f"'>{label}</th>"
+            for label, align in header_cols
         )
         + "</tr>"
     )
 
-    # Hidden text blobs for the clipboard. We use <pre>/<script type="text/plain">
-    # to preserve newlines/tabs without HTML reinterpretation. Wrap in a
-    # display:none container so they don't render visually.
-    import html as _html_mod
+    # Hidden text blobs for the clipboard. We use <pre> to preserve
+    # newlines/tabs without HTML reinterpretation. Wrap in display:none.
     tsv_blob = _html_mod.escape("\n".join(tsv_rows))
     md_blob  = _html_mod.escape("\n".join(md_rows))
+    # Full HTML <table> blob — written to the clipboard as text/html so
+    # destinations that understand rich text (Word, Outlook, Gmail, Notion,
+    # Confluence WYSIWYG, ChatGPT, this chat box) paste it as a real table.
+    html_blob_raw = (
+        "<table style='border-collapse:collapse;font-family:Arial,sans-serif;'>"
+        + "".join(html_rows)
+        + "</table>"
+    )
+    html_blob = _html_mod.escape(html_blob_raw)
 
     copy_buttons = """
-      <div style='display:flex;gap:8px;align-items:center;'>
+      <div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap;'>
+        <button id='copy-issues-rich-btn'
+                onclick='copyIssues("html")'
+                style='font-size:11px;font-weight:700;padding:6px 12px;
+                       border-radius:6px;border:1px solid #b91c1c;
+                       background:#b91c1c;color:#fff;cursor:pointer;'
+                title='Copy as a real table (best for Word / Outlook / Gmail / Notion / Confluence / chat apps)'>
+          📋 Copy as Table
+        </button>
         <button id='copy-issues-tsv-btn'
                 onclick='copyIssues("tsv")'
                 style='font-size:11px;font-weight:600;padding:6px 12px;
                        border-radius:6px;border:1px solid #fecaca;
                        background:#fff;color:#b91c1c;cursor:pointer;'
-                title='Copy as TSV (pastes as a table in Excel / Google Sheets / Slack)'>
-          📋 Copy as TSV
+                title='Copy as TSV (best for Excel / Google Sheets)'>
+          📋 TSV
         </button>
         <button id='copy-issues-md-btn'
                 onclick='copyIssues("md")'
                 style='font-size:11px;font-weight:600;padding:6px 12px;
                        border-radius:6px;border:1px solid #fecaca;
                        background:#fff;color:#b91c1c;cursor:pointer;'
-                title='Copy as Markdown table (pastes into Jira / GitHub / Confluence)'>
-          📋 Copy as Markdown
+                title='Copy as Markdown (best for Jira / GitHub / Confluence source mode)'>
+          📋 Markdown
         </button>
       </div>
     """
 
     hidden_data = (
-        f"<pre id='issues-tsv-blob' style='display:none;'>{tsv_blob}</pre>"
-        f"<pre id='issues-md-blob'  style='display:none;'>{md_blob}</pre>"
+        f"<pre id='issues-tsv-blob'  style='display:none;'>{tsv_blob}</pre>"
+        f"<pre id='issues-md-blob'   style='display:none;'>{md_blob}</pre>"
+        f"<pre id='issues-html-blob' style='display:none;'>{html_blob}</pre>"
+    )
+
+    # Root-cause drill-down chips. Clicking a chip filters the issues table
+    # to that triage category; "All" clears. Colours mirror _triage_badge.
+    cat_palette = {
+        "PRODUCT_BUG":   ("#b91c1c", "#fee2e2"),
+        "LOCATOR_DRIFT": ("#92400e", "#fef3c7"),
+        "FLAKE":         ("#0369a1", "#dbeafe"),
+        "INFRA":         ("#7c3aed", "#ede9fe"),
+        "TEST_BUG":      ("#9f1239", "#fce7f3"),
+        "UNKNOWN":       ("#64748b", "#f1f5f9"),
+        "UNCLASSIFIED":  ("#64748b", "#f1f5f9"),
+    }
+    chip_parts = [
+        "<button class='rc-chip' data-rc='' onclick=\"filterRootCause('',this)\" "
+        "style='font-size:11px;font-weight:700;padding:3px 10px;border-radius:9999px;"
+        "border:1px solid #cbd5e1;background:#1e293b;color:#fff;cursor:pointer;'>"
+        f"All ({len(issue_rows)})</button>"
+    ]
+    for cat, n in sorted(rootcause_counts.items(), key=lambda kv: -kv[1]):
+        color, bg = cat_palette.get(cat, ("#64748b", "#f1f5f9"))
+        chip_parts.append(
+            f"<button class='rc-chip' data-rc='{_html_attr(cat)}' "
+            f"onclick=\"filterRootCause('{_html_attr(cat)}',this)\" "
+            f"style='font-size:11px;font-weight:700;padding:3px 10px;border-radius:9999px;"
+            f"border:1px solid {color}44;background:{bg};color:{color};cursor:pointer;'>"
+            f"{cat} ({n})</button>"
+        )
+    rootcause_chips = (
+        "<div class='no-print' style='display:flex;gap:6px;flex-wrap:wrap;"
+        "align-items:center;margin-bottom:12px;'>"
+        "<span style='font-size:11px;color:#94a3b8;font-weight:600;margin-right:4px;'>"
+        "Root cause:</span>" + "".join(chip_parts) + "</div>"
     )
 
     copy_script = """
       <script>
       (function () {
+        var MAP = {
+          tsv:  { src: 'issues-tsv-blob',  btn: 'copy-issues-tsv-btn'  },
+          md:   { src: 'issues-md-blob',   btn: 'copy-issues-md-btn'   },
+          html: { src: 'issues-html-blob', btn: 'copy-issues-rich-btn' }
+        };
+
         window.copyIssues = function (kind) {
-          var srcId = (kind === 'md') ? 'issues-md-blob' : 'issues-tsv-blob';
-          var btnId = (kind === 'md') ? 'copy-issues-md-btn' : 'copy-issues-tsv-btn';
-          var src = document.getElementById(srcId);
-          var btn = document.getElementById(btnId);
+          var m = MAP[kind] || MAP.tsv;
+          var src = document.getElementById(m.src);
+          var btn = document.getElementById(m.btn);
           if (!src || !btn) return;
-          var text = src.textContent;
+          var text     = src.textContent;
           var original = btn.textContent;
-          var done = function () {
+          var flash = function () {
             btn.textContent = '✓ Copied!';
             setTimeout(function () { btn.textContent = original; }, 1500);
           };
+
+          if (kind === 'html') {
+            // Rich-text path: put BOTH text/html and text/plain on the
+            // clipboard. Word / Outlook / Gmail / Notion / Confluence-
+            // WYSIWYG / most chat boxes read text/html and render the
+            // table. Plain-text destinations get the TSV as fallback.
+            var tsvSrc = document.getElementById('issues-tsv-blob');
+            var plain  = tsvSrc ? tsvSrc.textContent : text;
+            if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+              try {
+                var blobHtml = new Blob([text],  { type: 'text/html'  });
+                var blobText = new Blob([plain], { type: 'text/plain' });
+                navigator.clipboard.write([
+                  new ClipboardItem({ 'text/html': blobHtml, 'text/plain': blobText })
+                ]).then(flash, function () { execHtmlFallback(text, btn, original); });
+                return;
+              } catch (e) { /* fall through */ }
+            }
+            execHtmlFallback(text, btn, original);
+            return;
+          }
+
+          // Plain text path (tsv / md)
           if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text).then(done, function () {
-              // Fallback path for older browsers
+            navigator.clipboard.writeText(text).then(flash, function () {
               fallbackCopy(text, btn, original);
             });
           } else {
             fallbackCopy(text, btn, original);
           }
         };
+
         function fallbackCopy(text, btn, original) {
           var ta = document.createElement('textarea');
           ta.value = text;
@@ -854,30 +1232,92 @@ def _render_issues_section(records: list[TestRecord]) -> str:
           btn.textContent = '✓ Copied!';
           setTimeout(function () { btn.textContent = original; }, 1500);
         }
+
+        // Rich-text fallback for older browsers: render the HTML into
+        // a temporary contenteditable div, select it, then execCommand
+        // copy. The browser carries text/html to the clipboard for us.
+        function execHtmlFallback(html, btn, original) {
+          var holder = document.createElement('div');
+          holder.contentEditable = 'true';
+          holder.innerHTML = html;
+          holder.style.position = 'fixed';
+          holder.style.left = '-9999px';
+          document.body.appendChild(holder);
+          var range = document.createRange();
+          range.selectNodeContents(holder);
+          var sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+          try { document.execCommand('copy'); } catch (e) {}
+          sel.removeAllRanges();
+          document.body.removeChild(holder);
+          btn.textContent = '✓ Copied!';
+          setTimeout(function () { btn.textContent = original; }, 1500);
+        }
       })();
       </script>
     """
 
+    issues_toggle_script = """
+      <script>
+      (function () {
+        var KEY = 'flowguard-issues-collapsed';
+        window.toggleIssuesSection = function () {
+          var sec = document.getElementById('issues-section');
+          if (!sec) return;
+          var collapsed = sec.classList.toggle('issues-collapsed');
+          var caret = document.getElementById('issues-caret');
+          if (caret) caret.textContent = collapsed ? '▸' : '▾';
+          try { localStorage.setItem(KEY, collapsed ? '1' : '0'); } catch (e) {}
+        };
+        document.addEventListener('DOMContentLoaded', function () {
+          try {
+            if (localStorage.getItem(KEY) === '1') {
+              var sec = document.getElementById('issues-section');
+              if (sec) {
+                sec.classList.add('issues-collapsed');
+                var caret = document.getElementById('issues-caret');
+                if (caret) caret.textContent = '▸';
+              }
+            }
+          } catch (e) {}
+        });
+      })();
+      </script>
+      <style>
+        .issues-collapsed #issues-body { display: none !important; }
+      </style>
+    """
+
     return f"""
-    <div class="issues-section no-print-controls"
+    <div id="issues-section" class="issues-section no-print-controls"
          style="background:#fff;border:1px solid #fecaca;border-radius:12px;
                 padding:18px 22px;margin-bottom:20px;">
       <div style="display:flex;align-items:center;justify-content:space-between;
                   margin-bottom:10px;gap:12px;flex-wrap:wrap;">
-        <div style="font-size:14px;font-weight:700;color:#b91c1c;">
+        <div onclick="toggleIssuesSection()"
+             style="font-size:14px;font-weight:700;color:#b91c1c;cursor:pointer;
+                    user-select:none;display:flex;align-items:center;gap:8px;"
+             title="Click to expand / collapse the Issues table">
+          <span id="issues-caret" style="display:inline-block;font-size:12px;
+                color:#b91c1c;transition:transform .15s;">▾</span>
           🔴 Issues to Triage ({len(issue_rows)})
         </div>
         {copy_buttons}
       </div>
-      <div style="font-size:11px;color:#64748b;margin-bottom:10px;">
-        📷 Failure screenshot · 🖼️ Canvas · 🩺 Triage JSON · 🔗 URL at failure · ▶ Replay
+      <div id="issues-body">
+        <div style="font-size:11px;color:#64748b;margin-bottom:10px;">
+          📷 Failure screenshot · 🖼️ Canvas · 🩺 Triage JSON · 🔗 URL at failure · ▶ Replay
+        </div>
+        {rootcause_chips}
+        <table id="issues-table" style="width:100%;border-collapse:collapse;">
+          <thead>{head}</thead>
+          <tbody>{''.join(body_html)}</tbody>
+        </table>
       </div>
-      <table style="width:100%;border-collapse:collapse;">
-        <thead>{head}</thead>
-        <tbody>{''.join(body_html)}</tbody>
-      </table>
       {hidden_data}
       {copy_script}
+      {issues_toggle_script}
     </div>
     """
 
@@ -913,7 +1353,7 @@ def _render_recurring_failures_section(clusters) -> str:
         )
     table = "".join(rows)
     return f"""
-    <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;
+    <div class="dark-surface" style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;
                 padding:18px 22px;margin-bottom:20px;">
       <div style="display:flex;align-items:baseline;justify-content:space-between;
                   margin-bottom:10px;">
@@ -1067,6 +1507,8 @@ def _render(
     issues_html         = _render_issues_section(records)
 
     test_rows    = _render_test_rows(records, recurring_by_method=recurring_by_method)
+    toolbar_html = _render_test_results_toolbar(records)
+    filter_sort_script = _filter_sort_script()
     feature_rows = _render_feature_rows(stats["by_feature"])
     trend_rows   = _render_trend_rows(trend)
     health_html  = _render_health_section(health_score, layered) if layered else ""
@@ -1087,13 +1529,53 @@ def _render(
         text-transform: uppercase; letter-spacing: 0.5px; }}
   .card {{ background: #fff; border: 1px solid #e2e8f0; border-radius: 12px;
            padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }}
-  table {{ width: 100%; border-collapse: collapse; }}
+  /* Excel-style grid: every table on the dashboard shows visible row +
+     column lines around every cell. Single shared rule so it applies to
+     Test Results, Issues, Recurring Failures, Feature Coverage, JS
+     Clusters, Run History — every table without per-section overrides. */
+  table {{ width: 100%; border-collapse: collapse; border: 1px solid #cbd5e1; }}
+  th, td {{ border: 1px solid #e2e8f0; }}
   th {{ text-align: left; padding: 8px 12px; font-size: 11px; font-weight: 700;
-        color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px;
-        border-bottom: 2px solid #f1f5f9; }}
-  tr:not(:last-child) td {{ border-bottom: 1px solid #f1f5f9; }}
+        color: #475569; text-transform: uppercase; letter-spacing: 0.8px;
+        background: #f8fafc;
+        border-bottom: 2px solid #cbd5e1; }}
+  /* Dark-mode gridlines */
+  body.dark table {{ border-color: #475569 !important; }}
+  body.dark th, body.dark td {{ border-color: #334155 !important; }}
+  body.dark th {{ background: #1e293b !important; border-bottom-color: #475569 !important; }}
   a {{ text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
+
+  /* ── Collapsible sections ──────────────────────────────────────── */
+  .collapse-toggle {{ cursor: pointer; user-select: none; }}
+  .collapse-caret {{ display: inline-block; width: 14px; transition: transform .15s;
+                     color: #94a3b8; font-size: 11px; }}
+  .section-collapsed .collapse-body {{ display: none !important; }}
+  .section-collapsed .collapse-caret {{ transform: rotate(-90deg); }}
+
+  /* ── Screenshot hover preview popover ──────────────────────────── */
+  #hover-preview {{ position: fixed; z-index: 99999; display: none;
+                    pointer-events: none; border: 2px solid #cbd5e1;
+                    border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.35);
+                    background: #fff; padding: 3px; max-width: 460px; max-height: 320px; }}
+  #hover-preview img {{ max-width: 452px; max-height: 312px; display: block; border-radius: 5px; }}
+
+  /* ── Dark mode ─────────────────────────────────────────────────── */
+  body.dark {{ background: #0f172a !important; color: #e2e8f0 !important; }}
+  body.dark .card {{ background: #1e293b !important; border-color: #334155 !important;
+                     box-shadow: 0 1px 3px rgba(0,0,0,.4) !important; }}
+  body.dark h2 {{ color: #cbd5e1 !important; }}
+  body.dark th {{ color: #94a3b8 !important; border-bottom-color: #334155 !important; }}
+  body.dark tr:not(:last-child) td {{ border-bottom-color: #334155 !important; }}
+  /* Re-theme the inline-styled section surfaces + neutral text in dark mode */
+  body.dark .issues-section {{ background: #1e293b !important; border-color: #7f1d1d !important; }}
+  body.dark .dark-surface {{ background: #1e293b !important; border-color: #334155 !important; }}
+  body.dark td[style*="color:#64748b"],
+  body.dark td[style*="color:#1e293b"],
+  body.dark div[style*="color:#1e293b"],
+  body.dark div[style*="color:#0f172a"] {{ color: #e2e8f0 !important; }}
+  body.dark select, body.dark input, body.dark button.theme-aware {{
+    background: #0f172a !important; color: #e2e8f0 !important; border-color: #334155 !important; }}
 
   /* ────────────────────────────────────────────────────────────────
      Print / PDF export rules — triggered by the "🖨️ Export PDF"
@@ -1143,7 +1625,21 @@ def _render(
                   background:{decision.bg};border:2px solid {decision.color}55">
         <span style="font-size:18px;font-weight:800;color:{decision.color}">{decision.label}</span>
       </div>
-      <div class="no-print" style="margin-top:10px;">
+      <div class="no-print" style="margin-top:10px;display:flex;gap:8px;
+           align-items:center;justify-content:flex-end;">
+        <button onclick="toggleDarkMode()" class="theme-aware"
+                style="font-size:12px;font-weight:600;padding:8px 14px;
+                       border-radius:6px;border:1px solid #cbd5e1;
+                       background:#fff;color:#0f172a;cursor:pointer;"
+                title="Toggle dark / light mode">
+          <span id="dark-mode-label">🌙 Dark</span>
+        </button>
+        <label style="font-size:11px;color:#64748b;display:flex;align-items:center;
+               gap:5px;cursor:pointer;user-select:none;"
+               title="Auto-reload every 10s to pick up newly generated results">
+          <input type="checkbox" id="auto-reload-toggle" onchange="toggleAutoReload()">
+          🔄 Auto-refresh
+        </label>
         <button onclick="window.print()"
                 style="font-size:12px;font-weight:600;padding:8px 16px;
                        border-radius:6px;border:1px solid #cbd5e1;
@@ -1197,13 +1693,20 @@ def _render(
   <!-- All test results -->
   <div class="card">
     <h2>Test Results ({stats["total"]} tests · {_fmt_ms(stats["total_ms"])} total)</h2>
-    <table>
+    {toolbar_html}
+    <table id="test-results-table">
       <thead><tr>
-        <th>Test Method</th><th>Feature</th><th>Category</th>
-        <th>Status</th><th style="text-align:right">Duration</th><th>Artifacts</th>
+        <th class="sortable" data-sort="method"   onclick="sortTestTable('method',this)" style="cursor:pointer;user-select:none;">Test Method <span class="sort-ind"></span></th>
+        <th class="sortable" data-sort="feature"  onclick="sortTestTable('feature',this)" style="cursor:pointer;user-select:none;">Feature <span class="sort-ind"></span></th>
+        <th class="sortable" data-sort="category" onclick="sortTestTable('category',this)" style="cursor:pointer;user-select:none;">Category <span class="sort-ind"></span></th>
+        <th class="sortable" data-sort="status"   onclick="sortTestTable('status',this)" style="cursor:pointer;user-select:none;">Status <span class="sort-ind"></span></th>
+        <th class="sortable" data-sort="duration" onclick="sortTestTable('duration',this)" style="cursor:pointer;user-select:none;text-align:right;">Duration <span class="sort-ind"></span></th>
+        <th>Artifacts</th>
       </tr></thead>
-      <tbody>{test_rows}</tbody>
+      <tbody id="test-results-body">{test_rows}</tbody>
     </table>
+    <div id="tr-empty" style="display:none;padding:16px;text-align:center;
+         color:#94a3b8;font-size:13px;">No tests match the current filters.</div>
   </div>
 
   <!-- Trend -->
@@ -1224,6 +1727,7 @@ def _render(
 </div>
 
 </div>
+{filter_sort_script}
 </body>
 </html>"""
 

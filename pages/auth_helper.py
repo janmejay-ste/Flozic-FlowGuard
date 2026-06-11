@@ -51,16 +51,26 @@ def perform_login(
     manual_fallback_minutes: int = 3,
     skip_initial_navigation: bool = False,
     post_login_url_pattern: str = POST_LOGIN_URL_PATTERN,
+    enable_authv2: bool = True,
 ) -> None:
     """
     Navigate to login, attempt automated login, and wait for post-login redirect.
     If automated login fails (selector drift, captcha, etc.), wait up to
     `manual_fallback_minutes` for the user to complete login manually.
 
-    This mirrors the Java ManualLoginHelper behaviour. The fallback is
-    intentional — auth UI changes on a different schedule than the rest
-    of the product, and forcing the test to fail on every auth-UI tweak
-    is more noise than signal.
+    Two-stage login (current, post late-2026):
+        1. accounts.appypie.com/login  (legacy form)
+        2. authv2.flozic.ai/login      (Cognito Hosted UI second stage)
+
+    Stage 2 is handled automatically when `enable_authv2=True` (the default).
+    The legacy /connects redirect frequently flashes the destination URL
+    briefly before bouncing to authv2 — so `wait_for_url(post_login_pattern)`
+    can return early on the brief flash, leaving us stranded on the Cognito
+    login page. After stage 1 returns, we ALWAYS check whether we're on
+    authv2 and complete that form too, then re-wait for the final destination.
+
+    Set `enable_authv2=False` only if you know the flow you're testing
+    doesn't go through Cognito (rare).
     """
     if skip_initial_navigation:
         # The caller (e.g. flozic.ai build button) already navigated us to a
@@ -75,11 +85,12 @@ def perform_login(
     try:
         _automated_login(page, email, password, auto_timeout_ms,
                          post_login_url_pattern=post_login_url_pattern)
-        logger.info("Automated login succeeded. URL: %s", page.url)
+        logger.info("Stage-1 login succeeded. URL: %s", page.url)
     except Exception as e:
         first_line = str(e).split("\n", 1)[0]
         logger.warning(
-            "Automated login failed (%s). Waiting up to %d minutes for manual login.",
+            "Stage-1 automated login failed (%s). Waiting up to %d minutes "
+            "for manual login.",
             first_line,
             manual_fallback_minutes,
         )
@@ -87,7 +98,40 @@ def perform_login(
             post_login_url_pattern,
             timeout=manual_fallback_minutes * 60_000,
         )
-        logger.info("Manual login completed. URL: %s", page.url)
+        logger.info("Stage-1 manual login completed. URL: %s", page.url)
+
+    # ── Stage 2: authv2.flozic.ai Cognito Hosted UI ──────────────────────────
+    if enable_authv2:
+        # Local import to avoid a circular dependency at module load time
+        # (authv2_helper imports DEFAULT_EMAIL / DEFAULT_PASSWORD from here).
+        from pages.authv2_helper import (
+            handle_authv2_login_if_present, is_on_authv2,
+        )
+        authv2_was_handled = handle_authv2_login_if_present(
+            page, email=email, password=password,
+        )
+        if authv2_was_handled:
+            # After Cognito returns through /auth/cognito/callback, the page
+            # lands on the original destination (e.g. /connects). Wait for
+            # it so the caller doesn't race against an in-flight redirect.
+            try:
+                page.wait_for_url(
+                    post_login_url_pattern,
+                    timeout=auto_timeout_ms,
+                )
+                logger.info("Stage-2 (authv2) login completed. Final URL: %s",
+                            page.url)
+            except Exception as e:
+                logger.warning(
+                    "Stage-2 succeeded but final destination URL never matched "
+                    "the pattern (%s). Current URL: %s",
+                    str(e).split("\n", 1)[0], page.url,
+                )
+        elif is_on_authv2(page):
+            logger.warning(
+                "Page is on authv2 but handler reported it didn't run. "
+                "Caller may need to handle this manually. URL: %s", page.url,
+            )
 
 
 def _automated_login(

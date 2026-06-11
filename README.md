@@ -1,29 +1,23 @@
-# automate-workflow-py
+# Flozic FlowGuard — automate-workflow-py
 
-Python / Playwright / pytest counterpart to the Java / Selenium / TestNG
-project at `../automate-workflow-test/`. Implements Phase 2 + Phase 3
-of `docs/python-playwright-migration-plan.md` from the Java repo —
-project skeleton + first migrated test class.
+Python / Playwright / pytest QA framework for [flozic.ai](https://www.flozic.ai)
+(formerly Appy Pie Automate). End-to-end browser tests that drive the
+real product, with **AI verification at every step**: a GPT-4o agent
+checks that the workflow flozic actually builds matches what the user
+asked for, classifies failures into product-bug vs test-bug vs flake,
+and writes its reasoning to a self-contained dashboard.
 
-## What is and is not in this repo
+📖 **Read first:**
+- [`docs/system-design.md`](docs/system-design.md) — architecture, data-flow, AI-helper catalog, cost model
+- [`PROJECT_STRUCTURE.md`](PROJECT_STRUCTURE.md) — folder tree, file purposes, where-to-look-for-what
 
-**Migrated (here, Python):**
-- Browser-driven test infrastructure (pytest fixtures replacing
-  `BaseTest`)
-- The `AuthenticatedTest` sanity journey
-- Page objects required by that one test
-- A minimal snapshot writer that emits v3-schema-compatible JSON
+## What's in this repo
 
-**NOT migrated (still in Java repo):**
-- Scoring engine (`HealthPolicy`, `HealthTracker`, `RiskInterpreter`)
-- Dashboard HTML builder
-- PDF report builders
-- C4 cluster scoring, B4 schema migration
-- All other browser-driven tests (queued for Phase 4)
-
-The Python stack writes to the **same** `reports/trend/` directory the
-Java stack reads. The Java DashboardBuilder remains the canonical
-report generator. This is the hybrid model from the migration plan.
+- **37 end-to-end tests** — 10 hardcoded flozic.ai entry-point flows + 1 parametrized "diversified" test that generates fresh GPT prompts every run (27 variants by default)
+- **8 AI helpers** (`utils/ai_*.py`) — prompt generator, canvas validator, failure triage, visual regression, executive summary, PR review, Page Object scaffold generator, synthetic form-data generator. All graceful no-ops without an OpenAI key.
+- **A self-contained dashboard** (`utils/dashboard_builder.py`) — single HTML file with filter/search/sort, dark mode, Excel-grid tables, collapsible sections, screenshot hover previews, auto-refresh, copy-as-Table/TSV/Markdown, PDF export. Pure vanilla JS, works offline from `file://`.
+- **Failure clustering across runs** (`utils/failure_clustering.py`) — recency-weighted recurring-failure score, surfaced as 🔁 badges on the dashboard
+- **Health scoring** (`utils/health_tracker.py` + `utils/layered_health_scores.py`) — Product / Infra / Framework split, drives the READY/WARNING/AT_RISK/BLOCKED release decision
 
 ## Quick start
 
