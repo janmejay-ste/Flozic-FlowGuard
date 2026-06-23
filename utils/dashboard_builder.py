@@ -1322,6 +1322,67 @@ def _render_issues_section(records: list[TestRecord]) -> str:
     """
 
 
+def _render_login_routes_section() -> str:
+    """
+    Table showing which login surface each test hit:
+      - legacy-appypie : URL was accounts.appypie.com/login  → legacy form ran
+      - flozic-authv2  : URL was elsewhere → went straight to flozic authv2
+    """
+    try:
+        from utils.health_tracker import get_login_routes
+        routes = get_login_routes()
+    except Exception:
+        routes = []
+
+    if not routes:
+        return ""
+
+    legacy_count = sum(1 for _, r, _ in routes if r == "legacy-appypie")
+    flozic_count = sum(1 for _, r, _ in routes if r == "flozic-authv2")
+
+    rows = []
+    for test_name, route, url in routes:
+        if route == "legacy-appypie":
+            badge = ("<span style='background:#fef3c7;color:#92400e;"
+                     "padding:2px 8px;border-radius:10px;font-size:11px;"
+                     "font-weight:600'>LEGACY accounts.appypie.com</span>")
+        elif route == "flozic-authv2":
+            badge = ("<span style='background:#dcfce7;color:#15803d;"
+                     "padding:2px 8px;border-radius:10px;font-size:11px;"
+                     "font-weight:600'>FLOZIC authv2</span>")
+        else:
+            badge = ("<span style='background:#f1f5f9;color:#475569;"
+                     "padding:2px 8px;border-radius:10px;font-size:11px;"
+                     "font-weight:600'>UNKNOWN</span>")
+        short_url = (url[:80] + "…") if len(url) > 80 else url
+        rows.append(
+            f"<tr>"
+            f"<td style='padding:6px 12px;font-family:monospace;font-size:12px'>{test_name}</td>"
+            f"<td style='padding:6px 12px'>{badge}</td>"
+            f"<td style='padding:6px 12px;font-family:monospace;font-size:11px;color:#64748b'>{short_url}</td>"
+            f"</tr>"
+        )
+
+    return f"""
+    <div class="card">
+      <h2>🔐 Login Route Observations
+        <span style="font-size:12px;font-weight:400;color:#64748b;margin-left:8px">
+          legacy accounts.appypie.com: <b style="color:#92400e">{legacy_count}</b> ·
+          flozic authv2: <b style="color:#15803d">{flozic_count}</b>
+        </span>
+      </h2>
+      <table style="width:100%;border-collapse:collapse">
+        <thead><tr style="background:#f8fafc">
+          <th style="text-align:left;padding:8px 12px">Test</th>
+          <th style="text-align:left;padding:8px 12px">Route</th>
+          <th style="text-align:left;padding:8px 12px">URL at login</th>
+        </tr></thead>
+        <tbody>{''.join(rows)}</tbody>
+      </table>
+    </div>
+    """
+
+
 def _render_recurring_failures_section(clusters) -> str:
     """
     Standalone dashboard section listing recurring failure clusters
@@ -1513,6 +1574,7 @@ def _render(
     trend_rows   = _render_trend_rows(trend)
     health_html  = _render_health_section(health_score, layered) if layered else ""
     cluster_html = _render_cluster_section(clusters or [])
+    login_routes_html = _render_login_routes_section()
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1674,6 +1736,9 @@ def _render(
 
   <!-- Recurring Failures Across Runs -->
   {recurring_html}
+
+  <!-- Login route observations -->
+  {login_routes_html}
 
   <!-- Issues to Triage — focused FAIL/INVALID table with full context -->
   {issues_html}

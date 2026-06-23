@@ -40,7 +40,27 @@ LOGIN_URL = (
 # The login URL contains "connectcloud.appypie.com" in its `frompage`
 # query string, so a bare `**connectcloud.appypie.com**` glob falsely
 # matches the login page itself. Require the path component too.
-POST_LOGIN_URL_PATTERN = "**connectcloud.appypie.com/connects**"
+#
+# Partial-migration window: `loop.flozic.ai` is the new host, but the
+# legacy `connectcloud.appypie.com` host is still in use. Accept both via
+# a callable predicate (Playwright wait_for_url accepts str | regex | callable).
+def _post_login_url_matches(url: str) -> bool:
+    if not url:
+        return False
+    # Must be the destination, not the login page (which mentions the host
+    # in its frompage= query param). Match on path prefix /connects.
+    return (
+        ("connectcloud.appypie.com/connects" in url)
+        or ("loop.flozic.ai/connects" in url)
+    )
+
+
+POST_LOGIN_URL_PATTERN = _post_login_url_matches
+
+
+def _current_test_name() -> str:
+    """Best-effort current pytest test name for telemetry. '' if unknown."""
+    return os.environ.get("PYTEST_CURRENT_TEST", "").split(" ")[0] or "<unknown>"
 
 
 def perform_login(
@@ -50,7 +70,7 @@ def perform_login(
     auto_timeout_ms: int = 30_000,
     manual_fallback_minutes: int = 3,
     skip_initial_navigation: bool = False,
-    post_login_url_pattern: str = POST_LOGIN_URL_PATTERN,
+    post_login_url_pattern=POST_LOGIN_URL_PATTERN,
     enable_authv2: bool = True,
 ) -> None:
     """
@@ -82,23 +102,53 @@ def perform_login(
         logger.info("Navigating to login URL: %s", LOGIN_URL)
         page.goto(LOGIN_URL)
 
+    # ── Login-route detection ─────────────────────────────────────────────────
+    # If the current URL is on accounts.appypie.com/login, run the legacy
+    # stage-1 form AND record this on the dashboard. Otherwise we assume the
+    # OAuth flow has already skipped the legacy form (direct authv2 entry)
+    # and we proceed straight to stage-2.
+    current_url = page.url or ""
+    on_legacy_login = (
+        "accounts.appypie.com" in current_url and "/login" in current_url
+    )
+
     try:
-        _automated_login(page, email, password, auto_timeout_ms,
-                         post_login_url_pattern=post_login_url_pattern)
-        logger.info("Stage-1 login succeeded. URL: %s", page.url)
+        from utils.health_tracker import record_login_route
+        route = "legacy-appypie" if on_legacy_login else "flozic-authv2"
+        record_login_route(_current_test_name(), route, current_url)
+        if on_legacy_login:
+            logger.warning(
+                "[login-route] LEGACY accounts.appypie.com login detected — "
+                "running stage-1 form. URL: %s", current_url,
+            )
+        else:
+            logger.info(
+                "[login-route] Not on accounts.appypie.com — skipping stage-1, "
+                "proceeding to flozic (authv2) login. URL: %s", current_url,
+            )
     except Exception as e:
-        first_line = str(e).split("\n", 1)[0]
-        logger.warning(
-            "Stage-1 automated login failed (%s). Waiting up to %d minutes "
-            "for manual login.",
-            first_line,
-            manual_fallback_minutes,
-        )
-        page.wait_for_url(
-            post_login_url_pattern,
-            timeout=manual_fallback_minutes * 60_000,
-        )
-        logger.info("Stage-1 manual login completed. URL: %s", page.url)
+        logger.debug("Could not record login route: %s", e)
+
+    if on_legacy_login:
+        try:
+            _automated_login(page, email, password, auto_timeout_ms,
+                             post_login_url_pattern=post_login_url_pattern)
+            logger.info("Stage-1 login succeeded. URL: %s", page.url)
+        except Exception as e:
+            first_line = str(e).split("\n", 1)[0]
+            logger.warning(
+                "Stage-1 automated login failed (%s). Waiting up to %d minutes "
+                "for manual login.",
+                first_line,
+                manual_fallback_minutes,
+            )
+            page.wait_for_url(
+                post_login_url_pattern,
+                timeout=manual_fallback_minutes * 60_000,
+            )
+            logger.info("Stage-1 manual login completed. URL: %s", page.url)
+    else:
+        logger.info("Stage-1 skipped — not on accounts.appypie.com login.")
 
     # ── Stage 2: authv2.flozic.ai Cognito Hosted UI ──────────────────────────
     if enable_authv2:
@@ -139,7 +189,7 @@ def _automated_login(
     email: str,
     password: str,
     timeout_ms: int,
-    post_login_url_pattern: str = POST_LOGIN_URL_PATTERN,
+    post_login_url_pattern=POST_LOGIN_URL_PATTERN,
 ) -> None:
     """Inner automated login. Throws on any failure; caller handles fallback."""
     # Email field — multiple selectors to handle minor markup drift.

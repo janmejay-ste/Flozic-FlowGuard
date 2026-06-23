@@ -62,6 +62,7 @@ def run_flozic_app_connect_test(page: Page, app_key: str) -> None:
     slug = cfg["url_slug"]
     prompt = cfg["prompt"]
     expected_trigger = cfg["expected_trigger"]
+    kind = cfg.get("kind", "app")  # "app" (default) | "agent"
 
     # ── Optional: GPT-generated prompt instead of the hardcoded JSON ────────
     # Activate by setting FLOZIC_AI_PROMPT=true (+ OPENAI_API_KEY). When the
@@ -87,8 +88,11 @@ def run_flozic_app_connect_test(page: Page, app_key: str) -> None:
     landing = FlozicLandingPage(page)
     copilot = CopilotPanel(page)
 
-    # Step 1-3: open the app page, type prompt, click build.
-    landing.open_app(slug)
+    # Step 1-3: open the page (app or conversational-agent), type prompt, click build.
+    if kind == "agent":
+        landing.open_conversational_agent(slug)
+    else:
+        landing.open_app(slug)
     landing.submit_prompt(prompt)
 
     # Step 3.5: ISSUE handler — some apps (e.g. GoHighLevel) misroute the
@@ -109,10 +113,14 @@ def run_flozic_app_connect_test(page: Page, app_key: str) -> None:
     # Accept both via a callable predicate (Playwright wait_for_url accepts a
     # str | regex | callable).
     def _accept_either(url: str) -> bool:
+        # Accept legacy connectcloud.appypie.com AND new loop.flozic.ai —
+        # partial migration window, both hosts in use.
         return (
             "authv2.flozic.ai" in url
             or "connectcloud.appypie.com/connects" in url
             or "connectcloud.appypie.com/customeditor" in url
+            or "loop.flozic.ai/connects" in url
+            or "loop.flozic.ai/customeditor" in url
         )
 
     perform_login(

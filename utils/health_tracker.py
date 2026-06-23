@@ -42,6 +42,11 @@ class _HealthState:
     js_events: list[tuple[ConsoleEvent, str]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     _clusters_cache: list[ErrorCluster] | None = None  # invalidated on new events
+    # Login-route observations: (test_name, route, url) — route ∈
+    # {"legacy-appypie", "flozic-authv2", "unknown"}. Surfaced on the dashboard
+    # so we can see when the legacy accounts.appypie.com path was hit vs the
+    # new direct flozic login.
+    login_routes: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 _STATE = _HealthState()
@@ -104,8 +109,21 @@ def compute_score(total: int, passed: int, failed: int) -> int:
     return max(0, base - crit_penalty - high_penalty)
 
 
+def record_login_route(test_name: str, route: str, url: str) -> None:
+    """Record which login surface a test hit. Thread-safe."""
+    with _STATE.lock:
+        _STATE.login_routes.append((test_name, route, url))
+
+
+def get_login_routes() -> list[tuple[str, str, str]]:
+    """Return a snapshot of the recorded login-route observations."""
+    with _STATE.lock:
+        return list(_STATE.login_routes)
+
+
 def reset() -> None:
     """Clear all accumulated state. Useful between sessions in tests-of-tests."""
     with _STATE.lock:
         _STATE.js_events.clear()
         _STATE._clusters_cache = None
+        _STATE.login_routes.clear()

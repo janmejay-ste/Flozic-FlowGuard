@@ -25,9 +25,12 @@ logger = logging.getLogger(__name__)
 
 FLOZIC_HOME = "https://www.flozic.ai/"
 APP_INTEGRATIONS_URL = "https://www.flozic.ai/integrate/apps/{slug}/integrations"
+CONVERSATIONAL_AGENT_URL = "https://www.flozic.ai/agents/conversational/{slug}"
 
 # After login + redirect, the customeditor URL contains this path.
-CUSTOMEDITOR_URL_PATTERN = "**connectcloud.appypie.com/customeditor**"
+# Accepts both legacy connectcloud.appypie.com and the new loop.flozic.ai host
+# (partial migration — both are valid as of now).
+CUSTOMEDITOR_URL_PATTERN = "**/customeditor**"
 
 
 class FlozicLandingPage:
@@ -46,6 +49,12 @@ class FlozicLandingPage:
         """Open the app-specific integrations page (e.g. 'google-sheets')."""
         url = APP_INTEGRATIONS_URL.format(slug=app_slug)
         logger.info("Navigating to flozic.ai app page: %s", url)
+        self.page.goto(url, wait_until="domcontentloaded")
+
+    def open_conversational_agent(self, agent_slug: str) -> None:
+        """Open a conversational-agent page (e.g. 'telegram-bot')."""
+        url = CONVERSATIONAL_AGENT_URL.format(slug=agent_slug)
+        logger.info("Navigating to flozic.ai conversational-agent page: %s", url)
         self.page.goto(url, wait_until="domcontentloaded")
 
     # ── Prompt submission ─────────────────────────────────────────────────────
