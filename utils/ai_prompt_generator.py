@@ -56,8 +56,28 @@ def _cache_path(slug: str, n: int, model: str) -> Path:
     return Path(CACHE_DIR) / f"{slug}_{n}_{safe_model}.json"
 
 
+def _cache_enabled() -> bool:
+    """
+    Cache policy: fresh prompts every run by DEFAULT — the test framework
+    wants new GPT prompts on each run to maximise coverage variety.
+
+    Set FLOZIC_USE_PROMPT_CACHE=true to opt in to caching (saves ~$0.30/run
+    by reusing the previously generated variants).
+
+    The legacy FLOZIC_REGEN_PROMPTS=true flag is still respected for
+    backward compatibility, but it's now a no-op since regenerate is the
+    default. It also forces a fresh batch when caching IS enabled, which
+    is useful when you want to bust an opt-in cache.
+    """
+    use_cache = os.environ.get("FLOZIC_USE_PROMPT_CACHE", "").lower() in ("1", "true", "yes")
+    regen     = os.environ.get("FLOZIC_REGEN_PROMPTS", "").lower() in ("1", "true", "yes")
+    if regen:
+        return False  # explicit bust — never read cache
+    return use_cache   # default False -> regenerate each run
+
+
 def _cache_read(slug: str, n: int, model: str) -> list["GeneratedPrompt"] | None:
-    if os.environ.get("FLOZIC_REGEN_PROMPTS", "").lower() in ("1", "true", "yes"):
+    if not _cache_enabled():
         return None
     p = _cache_path(slug, n, model)
     if not p.exists():
@@ -71,6 +91,10 @@ def _cache_read(slug: str, n: int, model: str) -> list["GeneratedPrompt"] | None
 
 
 def _cache_write(slug: str, n: int, model: str, items: list["GeneratedPrompt"]) -> None:
+    # Only write to cache when caching is opted-in. Otherwise we'd accumulate
+    # stale files that the user has to clean up manually.
+    if not _cache_enabled():
+        return
     p = _cache_path(slug, n, model)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)

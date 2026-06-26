@@ -25,9 +25,17 @@ logger = logging.getLogger(__name__)
 
 FLOZIC_HOME = "https://www.flozic.ai/"
 APP_INTEGRATIONS_URL = "https://www.flozic.ai/integrate/apps/{slug}/integrations"
+CONVERSATIONAL_AGENT_URL = "https://www.flozic.ai/agents/conversational/{slug}"
+
+# Expected post-login destination for conversational-agent flows. The product
+# is currently misrouting these to /connects (the workflow dashboard) instead
+# of /agent/builder — tracked as a product bug; see test xfail reasons.
+AGENT_BUILDER_URL_PATTERN = "**/agent/builder**"
 
 # After login + redirect, the customeditor URL contains this path.
-CUSTOMEDITOR_URL_PATTERN = "**connectcloud.appypie.com/customeditor**"
+# Accepts both legacy connectcloud.appypie.com and the new loop.flozic.ai host
+# (partial migration — both are valid as of now).
+CUSTOMEDITOR_URL_PATTERN = "**/customeditor**"
 
 
 class FlozicLandingPage:
@@ -46,6 +54,12 @@ class FlozicLandingPage:
         """Open the app-specific integrations page (e.g. 'google-sheets')."""
         url = APP_INTEGRATIONS_URL.format(slug=app_slug)
         logger.info("Navigating to flozic.ai app page: %s", url)
+        self.page.goto(url, wait_until="domcontentloaded")
+
+    def open_conversational_agent(self, agent_slug: str) -> None:
+        """Open a conversational-agent page (e.g. 'telegram-bot')."""
+        url = CONVERSATIONAL_AGENT_URL.format(slug=agent_slug)
+        logger.info("Navigating to flozic.ai conversational-agent page: %s", url)
         self.page.goto(url, wait_until="domcontentloaded")
 
     # ── Prompt submission ─────────────────────────────────────────────────────
@@ -98,12 +112,37 @@ class FlozicLandingPage:
         build_btn.click()
         logger.info("Build button clicked. Label: '%s'", label)
 
+    # ── Post-submit wait: conversational-agent builder ────────────────────────
+    def wait_for_agent_builder(self, timeout_ms: int = 60_000) -> None:
+        """
+        After clicking the build button on a conversational-agent page
+        (/agents/conversational/{slug}), the OAuth flow should land on
+        https://loop.flozic.ai/agent/builder?agent=chat. Wait for that URL.
+
+        Misrouting to /connects is a product bug — log it loudly so failure
+        artifacts surface the regression in dashboard logs.
+        """
+        try:
+            self.page.wait_for_url(AGENT_BUILDER_URL_PATTERN, timeout=timeout_ms)
+            logger.info("Landed on agent builder: %s", self.page.url)
+        except PlaywrightTimeoutError:
+            current = self.page.url or ""
+            if "/connects" in current:
+                logger.warning(
+                    "[ISSUE] Conversational-agent flow misrouted: expected "
+                    "/agent/builder?agent=chat, got /connects. URL: %s  "
+                    "-- This is a product-side routing defect on agent pages.",
+                    current,
+                )
+            raise
+
     # ── Post-submit wait ──────────────────────────────────────────────────────
     def wait_for_customeditor(self, timeout_ms: int = 180_000) -> None:
         """
         After clicking the build button the page goes through login (handled
         externally by perform_login) and then lands on customeditor. Wait for
-        the customeditor URL.
+        the customeditor URL. Accepts BOTH legacy connectcloud.appypie.com and
+        the new loop.flozic.ai hosts — no forced rewrite (partial migration).
         """
         self.page.wait_for_url(CUSTOMEDITOR_URL_PATTERN, timeout=timeout_ms)
         logger.info("Landed on customeditor: %s", self.page.url)

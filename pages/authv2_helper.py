@@ -65,11 +65,28 @@ def handle_authv2_login_if_present(
             logger.info("Not on authv2 (URL=%s) — skipping second-stage login.", page.url)
             return False
 
+    # Idempotency guard: if we're on /verifyPassword, credentials were already
+    # submitted by a prior call — Cognito is mid-redirect. Don't re-enter the form.
+    current_url = page.url or ""
+    if "/verifyPassword" in current_url or "/auth/cognito/callback" in current_url:
+        logger.info("authv2 already past login form (URL=%s) — skipping.", current_url)
+        return False
+
     logger.info("On authv2 Cognito login (%s). Submitting credentials.", page.url)
 
     # ── Step 1: username ─────────────────────────────────────────────────────
+    # Use a short probe first — if the username field isn't there within a few
+    # seconds, the form isn't actually present (e.g. redundant call after the
+    # form was already submitted). Return False instead of waiting 20s.
     username_field = page.locator("input[name='username']").first
-    username_field.wait_for(state="visible", timeout=step_timeout_ms)
+    try:
+        username_field.wait_for(state="visible", timeout=3_000)
+    except PlaywrightTimeoutError:
+        logger.info(
+            "authv2 username field not visible within 3s (URL=%s) — "
+            "form likely already submitted; skipping.", page.url,
+        )
+        return False
     username_field.click()
     username_field.fill(email)
     logger.info("[authv2] Username entered.")

@@ -22,13 +22,51 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
 logger = logging.getLogger(__name__)
 
-SIGNUP_PATH_FRAGMENT = "/register"
+SIGNUP_PATH_FRAGMENTS = ("/register", "/signup")
+SIGNUP_HOST_FRAGMENTS = ("accounts.appypie", "authv2.flozic.ai")
+
+
+def _has_signup_dom_markers(page: Page) -> bool:
+    """
+    DOM-based fallback: the authv2.flozic.ai Cognito Hosted UI renders the
+    signup form at the root URL (no /signup path), so URL-only detection
+    misses it. Identify the signup form by its content — 'Confirm password'
+    input, the 'Sign up' submit button, OR the 'Have an account already?'
+    link block all uniquely identify the signup variant.
+    """
+    markers = [
+        "input[placeholder='Reenter password']",
+        "input[name='confirm_password']",
+        "button[type='submit']:has-text('Sign up')",
+        "text=Have an account already?",
+        "text=Confirm password",
+    ]
+    for sel in markers:
+        try:
+            if page.locator(sel).first.is_visible(timeout=500):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def is_on_signup(page: Page) -> bool:
-    """True when the current URL is on the accounts.appypie.com signup page."""
+    """
+    True when the page is showing a signup form — either by URL match
+    (legacy accounts.appypie.com/register or authv2 /signup) OR by DOM
+    fingerprint (authv2 renders signup at the root URL without a /signup
+    path, so we fall back to spotting the 'Confirm password' / 'Sign up'
+    elements that only appear on the signup variant).
+    """
     url = (page.url or "").lower()
-    return SIGNUP_PATH_FRAGMENT in url and "accounts.appypie" in url
+    on_signup_path = any(p in url for p in SIGNUP_PATH_FRAGMENTS)
+    on_signup_host = any(h in url for h in SIGNUP_HOST_FRAGMENTS)
+    if on_signup_path and on_signup_host:
+        return True
+    # Fallback: authv2 host + signup-specific DOM markers.
+    if "authv2.flozic.ai" in url and _has_signup_dom_markers(page):
+        return True
+    return False
 
 
 def switch_signup_to_login_if_needed(
@@ -57,16 +95,33 @@ def switch_signup_to_login_if_needed(
     )
 
     # Try a cascade of selectors for the 'switch to login' link. Different
-    # Appy Pie auth-UI builds use different text/markup for this link.
+    # Appy Pie auth-UI builds (legacy accounts.appypie.com + new authv2 Cognito
+    # Hosted UI with awsui_* classes) use different text/markup for this link.
+    #
+    # IMPORTANT — selector specificity matters here. The flozic signup page
+    # contains a "Sign in with Google" button alongside the "Sign in" link.
+    # A loose `a:has-text('Sign in')` partial-match selector incorrectly hits
+    # the Google button. We therefore prefer:
+    #   1. href-based selectors (link points to /login — Google button doesn't)
+    #   2. exact-text selectors (':text-is' requires the full text equality)
+    # Fallback partial-text selectors come last AND only inside the
+    # 'Have an account already?' block, where the Google button can't reach.
     link_selectors = [
-        "a:has-text('Sign in')",
-        "a:has-text('Sign In')",
-        "a:has-text('Log in')",
-        "a:has-text('Log In')",
-        "a:has-text('Login')",
-        "a:has-text('Already have an account')",
+        # 1. href-based — most specific, can't false-match the Google button.
+        "a[href*='/login?client_id=']",
         "a[href*='accounts.appypie.com/login']",
-        "a[href*='/login']",
+        "a[href*='/login']:not([href*='google'])",
+        # 2. Exact-text — won't match 'Sign in with Google' (different full text).
+        "a:text-is('Sign in')",
+        "a:text-is('Sign In')",
+        "a:text-is('Log in')",
+        "a:text-is('Log In')",
+        "a:text-is('Login')",
+        # 3. authv2 Cognito Hosted UI: anchor with awsui_link_* class + exact text
+        "a[class*='awsui_link']:text-is('Sign in')",
+        # 4. Scoped by container — only links inside the 'Have an account already?'
+        #    block (a <p> containing that exact phrase), so Google can't reach.
+        "p:has-text('Have an account already?') a",
     ]
     for sel in link_selectors:
         try:
@@ -74,10 +129,13 @@ def switch_signup_to_login_if_needed(
             link.wait_for(state="visible", timeout=1_500)
             link.click(timeout=5_000)
             logger.info("Clicked signup->login switch link via selector: %s", sel)
-            # Wait for the URL to actually flip to /login.
+            # Wait for the URL to flip to a /login path on EITHER host.
             try:
-                page.wait_for_url("**accounts.appypie.com/login**",
-                                  timeout=timeout_ms)
+                page.wait_for_url(
+                    lambda u: ("/login" in (u or ""))
+                              and ("accounts.appypie" in u or "authv2.flozic.ai" in u),
+                    timeout=timeout_ms,
+                )
             except PlaywrightTimeoutError:
                 logger.warning(
                     "Clicked switch link but URL did not change to /login "
