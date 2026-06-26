@@ -1322,6 +1322,84 @@ def _render_issues_section(records: list[TestRecord]) -> str:
     """
 
 
+def _render_browser_tabs() -> str:
+    """
+    Render a tab strip showing all available browser dashboards. Auto-
+    detects sibling per-browser folders under reports/trend/ (created by
+    parallel runs via --browser firefox / --browser webkit). The current
+    browser's tab is marked active; the others link to their dashboard.
+
+    Layout assumption (matches conftest._report_root):
+      reports/trend/dashboard.html             ← chromium (root)
+      reports/trend/firefox/dashboard.html     ← firefox
+      reports/trend/webkit/dashboard.html      ← webkit
+    """
+    current = DASHBOARD_PATH.resolve()
+    trend_root = Path("reports/trend").resolve()
+
+    # Determine which engine we're currently rendering.
+    if current.parent == trend_root:
+        active_engine = "chromium"
+    else:
+        active_engine = current.parent.name  # firefox / webkit / ...
+
+    # Discover all sibling dashboards that exist on disk.
+    available: list[tuple[str, Path]] = []
+    chromium_dash = trend_root / "dashboard.html"
+    if chromium_dash.exists() or active_engine == "chromium":
+        available.append(("chromium", chromium_dash))
+    for engine in ("firefox", "webkit"):
+        sub = trend_root / engine / "dashboard.html"
+        if sub.exists() or active_engine == engine:
+            available.append((engine, sub))
+
+    # Skip the strip entirely if only one dashboard exists — no value yet.
+    if len(available) <= 1:
+        return ""
+
+    icons = {"chromium": "🟢", "firefox": "🦊", "webkit": "🧭"}
+    labels = {"chromium": "Chromium", "firefox": "Firefox", "webkit": "WebKit"}
+
+    tabs: list[str] = []
+    for engine, dash_path in available:
+        is_active = (engine == active_engine)
+        # Build relative href from this dashboard to the target dashboard.
+        if is_active:
+            href = "#"
+        else:
+            try:
+                href = str(dash_path.resolve().relative_to(current.parent))
+            except ValueError:
+                # Different drives / not relative — fall back to absolute file URL.
+                href = f"file://{dash_path.resolve()}"
+        if is_active:
+            style = (
+                "background:#0f172a;color:#fff;padding:8px 18px;"
+                "border-radius:8px 8px 0 0;font-weight:700;font-size:13px;"
+                "border:1px solid #0f172a;border-bottom:none;"
+                "display:inline-block;text-decoration:none;cursor:default;"
+            )
+        else:
+            style = (
+                "background:#f1f5f9;color:#475569;padding:8px 18px;"
+                "border-radius:8px 8px 0 0;font-weight:600;font-size:13px;"
+                "border:1px solid #cbd5e1;border-bottom:none;margin-right:2px;"
+                "display:inline-block;text-decoration:none;"
+            )
+        tabs.append(
+            f"<a href='{href}' style=\"{style}\">"
+            f"{icons.get(engine, '🌐')} {labels.get(engine, engine.title())}"
+            f"</a>"
+        )
+
+    return (
+        "<div style='border-bottom:2px solid #0f172a;margin-bottom:18px;"
+        "padding-bottom:0;display:flex;align-items:flex-end;gap:0;'>"
+        + "".join(tabs)
+        + "</div>"
+    )
+
+
 def _render_login_routes_section() -> str:
     """
     Table showing which login surface each test hit:
@@ -1575,6 +1653,7 @@ def _render(
     health_html  = _render_health_section(health_score, layered) if layered else ""
     cluster_html = _render_cluster_section(clusters or [])
     login_routes_html = _render_login_routes_section()
+    browser_tabs_html = _render_browser_tabs()
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1712,6 +1791,10 @@ def _render(
       </div>
     </div>
   </div>
+
+  <!-- Browser tabs (chromium / firefox / webkit) — only shown when
+       multiple per-browser dashboards exist on disk. -->
+  {browser_tabs_html}
 
   <!-- AI Executive Summary -->
   {exec_html}

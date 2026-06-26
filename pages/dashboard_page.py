@@ -110,10 +110,14 @@ class DashboardPage:
         Open the profile menu, click 'Logout', wait for post-logout
         redirect to the accounts.appypie.com login page.
         """
-        # If we're not on the dashboard URL, navigate there first.
-        if "connects" not in self.page.url and "dashboard" not in self.page.url:
-            logger.info("Not on dashboard, navigating there before logout...")
-            self.page.goto("https://connectcloud.appypie.com/connects")
+        # If we're not on the dashboard URL, navigate there first. Prefer the
+        # new loop.flozic.ai host; the legacy connectcloud.appypie.com host
+        # auto-redirects on this path anyway, but we want fewer hops.
+        current = self.page.url or ""
+        if "connects" not in current and "dashboard" not in current:
+            target = "https://loop.flozic.ai/connects"
+            logger.info("Not on dashboard, navigating to %s before logout...", target)
+            self.page.goto(target)
             self.page.wait_for_load_state("domcontentloaded")
 
         logger.info("Performing logout...")
@@ -142,10 +146,12 @@ class DashboardPage:
         logout_link.click()
         logger.info("Logout link clicked.")
 
-        logger.info("Waiting for redirect to accounts.appypie.com...")
+        logger.info("Waiting for redirect to login page (legacy or authv2)...")
         try:
+            # Accept either legacy accounts.appypie.com/login OR authv2.flozic.ai/login.
             self.page.wait_for_url(
-                "**accounts.appypie.com/login**",
+                lambda u: ("/login" in (u or ""))
+                          and ("accounts.appypie" in u or "authv2.flozic.ai" in u),
                 timeout=timeout_ms,
             )
         except PlaywrightTimeoutError:

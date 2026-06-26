@@ -69,6 +69,20 @@ def _build_prompt(user_prompt: str, expected_trigger: str) -> str:
         "  2. Are the Action card(s) visible with real app names (not "
         "'Select Action App')?\n"
         "  3. Does the trigger app shown match the expected one above?\n\n"
+        "IMPORTANT — judge LENIENTLY on event-name details:\n"
+        "  - Each integration only exposes a fixed list of trigger/action "
+        "events; the user's prompt may reference an event that doesn't "
+        "exist on that integration (e.g. 'New Lead' in HubSpot when only "
+        "'New Deal' is available; 'summarize' for ChatGPT when only "
+        "'Create image' / 'Create completion' are available).\n"
+        "  - If the trigger APP and action APPS match the user's intent, "
+        "treat the workflow as VALID even if the specific event picked is "
+        "the closest available rather than the exact one the user named. "
+        "Note the substitution in 'reasoning' but set is_valid=true.\n"
+        "  - Only set is_valid=false if a wrong APP is on the canvas, a "
+        "placeholder is still visible, or the substituted event is clearly "
+        "wrong (e.g. 'Delete Contact' picked when the prompt said 'Create "
+        "Contact').\n\n"
         "Reply with a SINGLE JSON object, no other text, with keys:\n"
         "  is_valid (bool), trigger_app (string), action_apps (list of "
         "strings), placeholders_visible (bool), reasoning (string, one "
@@ -181,8 +195,12 @@ def validate_canvas_with_ai(
     try:
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
+        if content is None or not isinstance(content, str):
+            raise ValueError(
+                f"OpenAI returned empty/non-string content (type={type(content).__name__})"
+            )
         parsed: dict[str, Any] = json.loads(content)
-    except (KeyError, ValueError, json.JSONDecodeError) as e:
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
         logger.error("[AI] Could not parse OpenAI response: %s", e)
         return _persist(AIValidationResult(
             status="ERROR", is_valid=False,

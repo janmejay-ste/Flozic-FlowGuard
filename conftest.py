@@ -12,6 +12,7 @@ provided in the TestNG project:
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -21,11 +22,18 @@ import pytest
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
 from utils.js_console_monitor import JsConsoleMonitor
+from utils.network_monitor import NetworkMonitor, export_run_overview
 from utils.snapshot_writer import add_test_record, write_snapshot, _STATE
 from utils.dashboard_builder import build as build_dashboard
 import utils.health_tracker as _ht
 
 logger = logging.getLogger(__name__)
+
+# Feature flag — disable network capture without code changes when debugging
+# the monitor itself or chasing a perf regression in the monitor.
+ENABLE_NETWORK_CAPTURE = os.environ.get(
+    "FLOWGUARD_NETWORK_CAPTURE", "1",
+).strip().lower() not in ("0", "false", "no", "off")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -60,6 +68,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Playwright slow_mo delay in ms for debugging.",
     )
     parser.addoption(
+        "--browser",
+        default="chromium",
+        choices=("chromium", "firefox", "webkit"),
+        help=(
+            "Which Playwright browser engine to launch. Default: chromium. "
+            "Use 'firefox' or 'webkit' for cross-browser runs. Install the "
+            "engine first with: playwright install <engine>."
+        ),
+    )
+    parser.addoption(
         "--cohort",
         default=None,
         help=(
@@ -82,26 +100,90 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 @pytest.fixture(scope="session")
 def browser_instance(request: pytest.FixtureRequest) -> Iterator[Browser]:
-    """One Chromium instance per test session."""
+    """One browser instance per test session — engine chosen by --browser."""
     headless = request.config.getoption("--headless")
     slow_mo = request.config.getoption("--slow-mo")
+    engine = request.config.getoption("--browser")
 
     logger.info(
-        "[session] Launching Chromium (headless=%s, slow_mo=%d ms)",
-        headless,
-        slow_mo,
+        "[session] Launching %s (headless=%s, slow_mo=%d ms)",
+        engine, headless, slow_mo,
     )
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
+        # Chromium accepts --start-maximized; Firefox/WebKit ignore CLI args
+        # and use viewport sizing instead.
+        if engine == "chromium":
+            launcher = pw.chromium
+            launch_args = ["--start-maximized", "--disable-notifications"]
+        elif engine == "firefox":
+            launcher = pw.firefox
+            launch_args = []
+        else:  # webkit
+            launcher = pw.webkit
+            launch_args = []
+
+        browser = launcher.launch(
             headless=headless,
             slow_mo=slow_mo,
-            args=["--start-maximized", "--disable-notifications"],
+            args=launch_args,
         )
         try:
             yield browser
         finally:
             browser.close()
-            logger.info("[session] Chromium closed")
+            logger.info("[session] %s closed", engine)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Repoint snapshot/dashboard/pdf module-level paths to a per-browser
+    folder so parallel runs (e.g. chromium + firefox in two terminals) write
+    to separate directories and never overwrite each other's results."""
+    _retarget_report_paths(config)
+
+
+def _report_root(config: pytest.Config) -> Path:
+    """
+    Return the report-output root for THIS session, namespaced by browser
+    engine so parallel runs (Chrome + Firefox at the same time) write to
+    different folders and never collide.
+
+      --browser chromium → reports/trend/          (unchanged default)
+      --browser firefox  → reports/trend/firefox/
+      --browser webkit   → reports/trend/webkit/
+    """
+    engine = config.getoption("--browser")
+    base = Path("reports/trend")
+    return base if engine == "chromium" else (base / engine)
+
+
+def _retarget_report_paths(config: pytest.Config) -> Path:
+    """Repoint the module-level snapshot/dashboard paths to this run's
+    per-browser folder. Returns the resolved root for reuse by callers."""
+    root = _report_root(config)
+    root.mkdir(parents=True, exist_ok=True)
+
+    # snapshot_writer.SNAPSHOT_PATH
+    import utils.snapshot_writer as _sw
+    _sw.SNAPSHOT_PATH = root / "python-health-snapshot.json"
+
+    # dashboard_builder.DASHBOARD_PATH + TREND_JSON
+    import utils.dashboard_builder as _db
+    _db.DASHBOARD_PATH = root / "dashboard.html"
+    _db.TREND_JSON     = root / "trend-history.json"
+
+    # pdf_report_builder writes report-printable.html / .pdf into the
+    # same trend folder — repoint if it exposes a path constant too.
+    try:
+        import utils.pdf_report_builder as _pb
+        for attr in ("REPORT_PDF_PATH", "REPORT_PRINTABLE_PATH",
+                     "PDF_PATH", "PRINTABLE_PATH"):
+            if hasattr(_pb, attr):
+                old = getattr(_pb, attr)
+                setattr(_pb, attr, root / Path(old).name)
+    except Exception:
+        pass
+
+    return root
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -112,7 +194,9 @@ def session_teardown_snapshot() -> Iterator[None]:
       2. Build the Python-side HTML dashboard — no Java dependency.
       3. Compute layered health scores + error clusters.
       4. Build PDF report (weasyprint if installed, else printable HTML).
-    Always runs, even if tests failed.
+    Always runs, even if tests failed. Report paths are namespaced by
+    --browser via the pytest_configure hook so parallel runs (Chrome +
+    Firefox) don't collide.
     """
     yield
 
@@ -132,7 +216,9 @@ def session_teardown_snapshot() -> Iterator[None]:
         try:
             import shutil
             from datetime import datetime as _dt
-            archive_dir = Path("reports/trend/snapshots")
+            # Archive into the same per-browser folder the live snapshot lives in.
+            from utils.snapshot_writer import SNAPSHOT_PATH as _LIVE_SNAPSHOT
+            archive_dir = _LIVE_SNAPSHOT.parent / "snapshots"
             archive_dir.mkdir(parents=True, exist_ok=True)
             archive_path = archive_dir / (
                 _dt.fromtimestamp(started_at / 1000).strftime("%Y%m%d_%H%M%S")
@@ -185,6 +271,18 @@ def session_teardown_snapshot() -> Iterator[None]:
     except Exception as e:
         logger.error("[session] PDF/scores build failed: %s", e, exc_info=True)
 
+    # Session-wide network overview — aggregates the per-test summaries
+    # NetworkExporter has been accumulating throughout the run. Cheap to call
+    # (uses in-memory counters) and gives us the input for future failure-
+    # fingerprinting work without re-reading individual artifact folders.
+    try:
+        from utils.snapshot_writer import SNAPSHOT_PATH as _SNAPSHOT
+        run_dir = _SNAPSHOT.parent / "run_summary"
+        overview_path = export_run_overview(run_dir)
+        logger.info("[session] Network overview: %s", overview_path)
+    except Exception as e:
+        logger.warning("[session] Network overview write failed: %s", e)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Function-scope page lifecycle
@@ -206,11 +304,14 @@ def page(
 
     test_name = request.node.name
     # no_viewport=True lets Chrome use the actual OS window size — required
-    # for --start-maximized to take effect. In headless mode, Playwright
-    # falls back to a default viewport (1280x720) which is fine.
-    ctx_kwargs: dict = {
-        "no_viewport": True,
-    }
+    # for --start-maximized to take effect. Firefox/WebKit don't support
+    # --start-maximized, so we give them an explicit viewport instead.
+    engine = request.config.getoption("--browser")
+    ctx_kwargs: dict = (
+        {"no_viewport": True}
+        if engine == "chromium"
+        else {"viewport": {"width": 1440, "height": 900}}
+    )
     if record_video:
         # Playwright writes a <random>.webm file into this directory.
         # We move it to the right place (failure folder / recordings/) in teardown.
@@ -228,6 +329,22 @@ def page(
     # `console_monitor` fixture (which returns this same instance).
     _page_monitor = JsConsoleMonitor(pg)
     pg._js_monitor = _page_monitor  # type: ignore[attr-defined]
+
+    # Always-on network monitor — same lifecycle as the JS monitor. Capture
+    # is resilient: if attach raises, observability is disabled for this
+    # test but the test itself still runs.
+    _net_monitor: NetworkMonitor | None = None
+    if ENABLE_NETWORK_CAPTURE:
+        try:
+            _net_monitor = NetworkMonitor(pg)
+        except Exception:
+            logger.exception("[net] NetworkMonitor attach failed; capture disabled "
+                             "for this test.")
+            _net_monitor = None
+    # Namespaced attribute on Page — avoids collisions with future Playwright
+    # internals. Tests should use the `network_monitor` fixture instead of
+    # reaching into the attribute directly.
+    setattr(pg, "_flowguard_network_monitor", _net_monitor)
 
     try:
         yield pg
@@ -297,6 +414,23 @@ def page(
 
         context.close()
 
+        # Network monitor teardown is a two-step sequence:
+        #   1. finish_test() — record this test's traffic into the session
+        #      aggregator. Runs regardless of outcome so passing tests are
+        #      included in network_overview.json. Decoupled from export().
+        #   2. stop()       — detach Playwright listeners.
+        # Both are idempotent and isolated in try/except so observability
+        # failures never mask the test outcome.
+        if _net_monitor is not None:
+            try:
+                _net_monitor.finish_test()
+            except Exception as e:
+                logger.warning("[net] NetworkMonitor.finish_test() failed: %s", e)
+            try:
+                _net_monitor.stop()
+            except Exception as e:
+                logger.warning("[net] NetworkMonitor.stop() failed: %s", e)
+
         # Forward JS console events to the session-level health tracker so
         # ErrorClusterer and score computation can use them at session teardown.
         try:
@@ -332,6 +466,24 @@ def console_monitor(page: Page) -> JsConsoleMonitor:
     if monitor is None:
         monitor = JsConsoleMonitor(page)
     return monitor
+
+
+@pytest.fixture
+def network_monitor(page: Page) -> NetworkMonitor | None:
+    """
+    Return the session-level NetworkMonitor already attached to this page,
+    or None if network capture was disabled via FLOWGUARD_NETWORK_CAPTURE=0
+    (or if attach failed at startup).
+
+    Tests that want to assert on network behaviour should use this fixture
+    rather than poking at the page's private attribute directly:
+
+        def test_x(page, network_monitor):
+            page.goto(...)
+            failures = network_monitor.failures() if network_monitor else ()
+            assert all(e.status != 500 for e in failures)
+    """
+    return getattr(page, "_flowguard_network_monitor", None)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -383,6 +535,16 @@ def _capture_failure_artifacts(page: Page, test_name: str) -> str:
     except Exception:
         pass
 
+    # Network artifacts — pulled from the per-page NetworkMonitor attached
+    # in the page fixture. Writes network-summary.json + network-events.json
+    # alongside the DOM/screenshot. No-op when capture is disabled.
+    try:
+        net_monitor = getattr(page, "_flowguard_network_monitor", None)
+        if net_monitor is not None:
+            net_monitor.export(folder)
+    except Exception as e:
+        logger.warning("[net] Network artifact export failed: %s", e)
+
     logger.info("[failure] Artifacts saved to: %s", folder)
     return folder_name
 
@@ -426,6 +588,14 @@ def _record_outcome(
         cohort = "baseline-auth"
     else:
         cohort = "baseline-smoke"
+
+    # Tag cohort with the browser engine so a hypothetical cross-browser
+    # merged dashboard can still tell chromium runs from firefox runs.
+    # No-op for the default chromium engine to preserve historical cohort
+    # values used in trend comparisons.
+    _engine = request.config.getoption("--browser")
+    if _engine != "chromium":
+        cohort = f"{cohort}-{_engine}"
 
     add_test_record(
         category=category,

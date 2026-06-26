@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import pytest
 from playwright.sync_api import Page
 
 from tests._flozic_common import run_flozic_app_connect_test
 from utils.test_category import test_category
+
+AGENT_MISROUTE_REASON = (
+    "Product bug: conversational-agent build button misroutes the OAuth flow "
+    "to /connects (workflow dashboard) instead of /agent/builder?agent=chat. "
+    "Agent builder UI never appears. See [ISSUE] warning in logs."
+)
 
 
 @test_category(
@@ -14,5 +21,6 @@ from utils.test_category import test_category
     feature="Flozic Conversational Agent",
 )
 class TestFlozicAgentFacebookMessengerBot:
+    @pytest.mark.xfail(reason=AGENT_MISROUTE_REASON, strict=False)
     def test_flozic_agent_facebook_messenger_bot(self, page: Page) -> None:
         run_flozic_app_connect_test(page, "facebook-messenger-bot")

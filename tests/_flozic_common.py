@@ -136,8 +136,23 @@ def run_flozic_app_connect_test(page: Page, app_key: str) -> None:
     # the redirect didn't happen (normal path), True if credentials were resubmitted.
     handle_authv2_login_if_present(page)
 
-    # Step 5: wait for the final destination — dashboard JS reads the
-    # AIFormAutomationPrompt query param and navigates to /customeditor.
+    # Step 5: wait for the final destination. Branch by flow kind:
+    #   - App flow:   /customeditor — workflow auto-builds, copilot reports back
+    #   - Agent flow: /agent/builder?agent=chat — conversational bot builder UI
+    #
+    # PRODUCT BUG: agent flows currently misroute to /connects (the workflow
+    # dashboard) instead of /agent/builder. wait_for_agent_builder() logs an
+    # [ISSUE] line when this happens and re-raises so the test fails loudly.
+    if kind == "agent":
+        landing.wait_for_agent_builder(timeout_ms=60_000)
+        # Agent flow has a different success contract than apps — no copilot
+        # panel + 'Connect created!' message. For now, reaching the builder
+        # URL IS the success gate. Skip the app-specific copilot assertions.
+        logger.info(
+            "=== SUCCESS: flozic agent builder reached for agent=%s ===", app_key,
+        )
+        return
+
     landing.wait_for_customeditor(timeout_ms=120_000)
 
     # Step 6-7: copilot opens and reports 'Connect created!'.
