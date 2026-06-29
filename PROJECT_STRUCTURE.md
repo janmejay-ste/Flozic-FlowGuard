@@ -22,9 +22,9 @@ FlowGuard/
 │   ├── test_flozic_chatgpt.py           │
 │   ├── test_flozic_cliniko.py           │
 │   ├── test_flozic_gmail.py             │
-│   ├── test_flozic_gohighlevel.py       │  15 hardcoded flozic.ai
-│   ├── test_flozic_google_sheets.py     │  integration app tests
-│   ├── test_flozic_housecall_pro.py     │
+│   ├── test_flozic_gohighlevel.py       │  hardcoded flozic.ai
+│   ├── test_flozic_google_sheets.py     │  integration app tests (one
+│   ├── test_flozic_housecall_pro.py     │  file per app)
 │   ├── test_flozic_lightspeedxseries.py │
 │   ├── test_flozic_microsoft_excel.py   │
 │   ├── test_flozic_mindbody.py          │
@@ -35,13 +35,14 @@ FlowGuard/
 │   ├── test_flozic_whatsappbusiness.py  ┘
 │   │
 │   ├── test_flozic_agent_discord_bot.py         ┐
-│   ├── test_flozic_agent_facebook_messenger_bot.py │  5 AI agent
-│   ├── test_flozic_agent_telegram_bot.py         │  bot tests
+│   ├── test_flozic_agent_facebook_messenger_bot.py │  AI conversational-
+│   ├── test_flozic_agent_telegram_bot.py         │  agent bot tests
 │   ├── test_flozic_agent_twitter_bot.py          │
 │   ├── test_flozic_agent_whatsapp_bot.py         ┘
 │   │
 │   ├── test_flozic_diversified.py       Parametrized: N AI-generated variants per app
 │   ├── test_flozic_flow_by_automate.py  loop.flozic.ai flow-builder entry-point
+│   ├── test_pricing_plan_try_now.py     Pricing TRY NOW/BUY NOW flow (6 period×plan combos)
 │   │
 │   ├── test_app_directory.py            App directory browse + search
 │   ├── test_app_pairing.py              Cross-app pairing smoke
@@ -58,6 +59,10 @@ FlowGuard/
 │   ├── test_responsive.py               Responsive / viewport assertions
 │   ├── test_top_app_combinations.py     Top-N app-combination smoke
 │   ├── test_trending_app_integrations.py Trending integrations smoke
+│   │
+│   ├── unit/                            Unit / schema regression tests
+│   │   ├── test_network_schema.py       Golden-file regression for network artifact schema v1
+│   │   └── fixtures/golden/             Checked-in golden JSON for schema comparison
 │   │
 │   └── marketing/                       Marketing-page tests
 │       ├── test_homepage_functional.py
@@ -97,7 +102,10 @@ FlowGuard/
 │   ├── error_clusterer.py         Within-run JS error clustering
 │   ├── failure_clustering.py      Cross-run failure clustering
 │   ├── js_console_monitor.py      Page console error subscription
-│   ├── network_monitor.py         Network request / response monitoring
+│   ├── network_monitor.py         Per-page HTTP capture (NetworkMonitor),
+│   │                              analysis (NetworkAnalyzer), export
+│   │                              (NetworkExporter). Schema v1 frozen —
+│   │                              see tests/unit/test_network_schema.py.
 │   ├── dashboard_builder.py       Self-contained HTML dashboard
 │   ├── pdf_report_builder.py      Printable HTML / PDF
 │   ├── test_category.py           @test_category decorator
@@ -110,12 +118,14 @@ FlowGuard/
 │   ├── ai_exec_summary.py         GPT: dashboard executive summary
 │   ├── ai_pr_review.py            GPT: code review on git diff
 │   ├── ai_page_object.py          GPT: Page Object scaffold from DOM
-│   └── ai_form_data.py            GPT: synthetic form data (validate-before-cache)
+│   ├── ai_form_data.py            GPT: synthetic form data (validate-before-cache)
+│   └── ai_popup_validator.py      GPT: PlanChangeService popup vs business matrix
 │
 ├── scripts/                       Stand-alone CLIs
 │   ├── promote_baseline.py        Promote canvas.png → baselines/
 │   ├── ai_pr_review.py            CLI wrapper for PR review
-│   └── generate_page_object.py    CLI: URL/HTML → draft Page Object
+│   ├── generate_page_object.py    CLI: URL/HTML → draft Page Object
+│   └── validate_network_artifacts.py  Sprint-1 acceptance test for network observability layer
 │
 ├── docs/                          Architecture + ops docs
 │   ├── system-design.md           ◀── start here
@@ -144,20 +154,26 @@ FlowGuard/
             └── <YYYYMMDD_HHMMSS>.json
 ```
 
-## Key file counts
+## Test categories
 
-| Area | Files | Purpose |
-|---|---:|---|
-| `tests/` (flozic apps) | 15 | Hardcoded integration app tests |
-| `tests/` (flozic agents) | 5 | AI agent bot tests |
-| `tests/` (flozic other) | 2 | Diversified + loop.flozic.ai flow |
-| `tests/` (general) | 15 | Auth, navigation, pairing, UI, rebrand |
-| `tests/marketing/` | 7 | Homepage + pricing (smoke / functional / SEO) |
-| `pages/` (main) | 14 | Page Objects |
-| `pages/marketing/` | 4 | Marketing Page Objects |
-| `utils/` | 20 | Snapshot, scoring, AI helpers, dashboard, PDF |
-| `scripts/` | 3 | Promote baselines, PR review, page-object gen |
-| `docs/` | 6 | Architecture, ops, risk register |
+Counts drift on every commit, so this table describes **categories** rather
+than file counts. Run `find tests -name 'test_*.py' | wc -l` for a live total.
+
+| Area | Purpose |
+|---|---|
+| `tests/test_flozic_<app>.py` | One file per flozic.ai integration app (Gmail, ChatGPT, PayPal, etc.). Each invokes the shared `_flozic_common` runner. |
+| `tests/test_flozic_agent_<bot>.py` | Conversational-agent entry points (Discord, Telegram, WhatsApp, Twitter, Facebook). Currently `xfail` due to the `/connects` misroute product bug. |
+| `tests/test_flozic_diversified.py` | GPT-generated prompt variants × N apps. Cross-cutting AI workflow validation. |
+| `tests/test_pricing_plan_try_now.py` | Marketing pricing → TRY NOW / BUY NOW per (period × plan), AI-validated against PlanChangeService matrix. |
+| `tests/test_app_pairing.py` | App-directory pairing flow + Automate click + auth + workflow verification. |
+| `tests/test_authenticated_sanity.py`, `test_create_connect_workflow.py` | Core auth + connect-creation sanity. |
+| `tests/test_responsive.py`, `test_homepage_*.py`, `test_rebrand_completion.py` | UI / SEO / rebrand assertions. |
+| `tests/marketing/` | Homepage + pricing marketing-side checks (smoke / functional / SEO). |
+| `tests/unit/` | Pure-Python regression tests — currently the network-schema golden file. |
+| `pages/` | Playwright Page Objects (app pages + `pages/marketing/` for marketing pages). |
+| `utils/` | Domain logic: snapshots, scoring, AI helpers, dashboard, PDF, network monitor. |
+| `scripts/` | Stand-alone CLIs: baseline promotion, PR review, page-object scaffolding, artifact validation. |
+| `docs/` | Architecture, ops, risk register. `docs/system-design.md` is the canonical source. |
 
 ## What lives in git vs not
 
@@ -180,15 +196,27 @@ FlowGuard/
 pip install -r requirements.txt
 playwright install chromium
 
-# Required env vars (no defaults — empty falls back to manual login)
+# Required env vars for any test marked requires_login=True.
+# If either is empty, perform_login() falls back to a 3-minute manual-login
+# window — fine for local debugging, but will hang CI. Set both before
+# running login-required suites.
 export AUTOMATE_EMAIL="<your-test-account>@appypiellp.com"
 export AUTOMATE_PASSWORD="<password>"
+
+# Optional override: pin the test account's current subscription state
+# so the pricing AI-popup-validator computes the right expected category
+# from the PlanChangeService matrix. Default: "Enterprise".
+export FLOZIC_CURRENT_PLAN="Enterprise"
+
+# Optional toggle: disable network capture entirely (for benchmarking or
+# triaging suspected monitor issues). Default: enabled.
+export FLOWGUARD_NETWORK_CAPTURE=1
 
 # Optional — unlocks the AI features
 export OPENAI_API_KEY="sk-..."
 export OPENAI_MODEL="gpt-4o"
 
-# Run the 15-app smoke suite
+# Run the per-app flozic smoke suite (one file per integration app)
 python -m pytest tests/test_flozic_*.py --ignore=tests/test_flozic_diversified.py \
   --ignore=tests/test_flozic_agent_*.py --headed -v
 
@@ -219,4 +247,6 @@ python -m pytest tests/test_flozic_diversified.py --headed -v
 | Tune AI behaviour | `utils/ai_*.py` (system prompts at the top of each file) |
 | Tune the dashboard | `utils/dashboard_builder.py` |
 | Monitor network traffic | `utils/network_monitor.py` |
+| Validate network observability artifacts | `python scripts/validate_network_artifacts.py` |
+| Validate a pricing popup | `utils/ai_popup_validator.py` |
 | Add a Page Object for a new screen | `python scripts/generate_page_object.py <url-or-html-file>` |
