@@ -83,6 +83,21 @@ class AppDirectoryBrowsePage:
                 continue
         return True
 
-    def scroll_to_bottom(self) -> None:
-        self.page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-        self.page.wait_for_timeout(500)
+    def scroll_to_bottom(self, step_px: int = 600, pause_ms: int = 300) -> None:
+        """Scroll incrementally so infinite-scroll / lazy-load triggers fire."""
+        last_height = self.page.evaluate("document.body.scrollHeight")
+        while True:
+            self.page.evaluate(
+                f"window.scrollBy(0, {step_px});"
+            )
+            self.page.wait_for_timeout(pause_ms)
+            new_height = self.page.evaluate("document.body.scrollHeight")
+            current_y = self.page.evaluate("window.scrollY + window.innerHeight")
+            if current_y >= new_height or new_height == last_height:
+                break
+            last_height = new_height
+        # Final settle: wait for any in-flight network requests to finish
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=5_000)
+        except Exception:
+            self.page.wait_for_timeout(1_000)

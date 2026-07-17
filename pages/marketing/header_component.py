@@ -32,7 +32,9 @@ PRIMARY_LINKS: OrderedDict[str, str] = OrderedDict([
     ("Pricing",       "a[href*='/pricing'], a[href*='/pricing-plan'], a[title='Pricing']"),
     ("Blog",          "a[href='/blog/'], a[href$='/blog/']"),
     ("Sign Up",       "a[href*='/register'], a[href*='/signup'], a[title='Sign Up']"),
-    ("Login",         "a[href*='accounts.appypie'], a[href*='/login'], a[title='log in']"),
+    ("Login",         "a[href*='authv2.flozic.ai'], a[href*='accounts.appypie'], "
+                      "a[href*='/login'], a[title='log in'], a[title='Login'], "
+                      "a:has-text('Login'), a:has-text('Log in'), a:has-text('Sign in')"),
 ])
 
 

@@ -108,7 +108,7 @@ class DashboardPage:
     def click_logout(self, timeout_ms: int = 30_000) -> None:
         """
         Open the profile menu, click 'Logout', wait for post-logout
-        redirect to the accounts.appypie.com login page.
+        redirect to the authv2.flozic.ai login page (or legacy accounts.appypie.com).
         """
         # If we're not on the dashboard URL, navigate there first. Prefer the
         # new loop.flozic.ai host; the legacy connectcloud.appypie.com host

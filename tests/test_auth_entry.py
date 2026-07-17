@@ -68,7 +68,22 @@ class TestSignupEntry:
         page.wait_for_load_state("domcontentloaded")
 
     def test_signup_flow_starts_correctly(self) -> None:
-        self._page.locator(self.SIGNUP_LINK).first.click()
+        loc = self._page.locator(self.SIGNUP_LINK)
+        # Pick the first *visible* element — hidden mobile-menu duplicates
+        # are in the DOM before the visible desktop link in many frameworks.
+        clicked = False
+        for i in range(loc.count()):
+            el = loc.nth(i)
+            try:
+                if el.is_visible():
+                    el.scroll_into_view_if_needed()
+                    el.click(timeout=5_000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            raise RuntimeError("No visible signup link found on the homepage")
         wait_for_auth_transition(self._page, timeout_ms=30_000)
         assert is_in_valid_state(self._page), (
             f"Signup did not reach a valid auth state. URL={self._page.url}"

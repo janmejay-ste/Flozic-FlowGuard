@@ -86,21 +86,36 @@ automate-workflow-py/
 │   ├── _flozic_redirect_probe.py     # Ad-hoc probe (not a real test)
 │   ├── flozic_prompts.json           # Hardcoded prompt config per app
 │   │
-│   │  ┌── flozic.ai entry-point tests (10 hardcoded apps) ──┐
+│   │  ┌── flozic.ai entry-point tests (15 hardcoded apps) ──┐
+│   ├── test_flozic_acculynx.py
 │   ├── test_flozic_chatgpt.py
 │   ├── test_flozic_cliniko.py
 │   ├── test_flozic_gmail.py
 │   ├── test_flozic_gohighlevel.py    # @pytest.mark.xfail (known product bug)
 │   ├── test_flozic_google_sheets.py
 │   ├── test_flozic_housecall_pro.py
+│   ├── test_flozic_lightspeedxseries.py
 │   ├── test_flozic_microsoft_excel.py
 │   ├── test_flozic_mindbody.py
+│   ├── test_flozic_net_suite.py
 │   ├── test_flozic_paypal.py
+│   ├── test_flozic_shopify.py
 │   ├── test_flozic_telegram.py
+│   ├── test_flozic_whatsappbusiness.py
+│   │  └─────────────────────────────────────────────────────┘
+│   │
+│   │  ┌── AI agent bot tests ──┐
+│   ├── test_flozic_agent_discord_bot.py
+│   ├── test_flozic_agent_facebook_messenger_bot.py
+│   ├── test_flozic_agent_telegram_bot.py
+│   ├── test_flozic_agent_twitter_bot.py
+│   ├── test_flozic_agent_whatsapp_bot.py
 │   │  └─────────────────────────────────────────────────────┘
 │   │
 │   ├── test_flozic_diversified.py    # Parametrized: N GPT-generated prompts
 │   │                                 #   per app (FLOZIC_VARIANTS_PER_APP=3)
+│   ├── test_flozic_flow_by_automate.py  # loop.flozic.ai flow-builder entry-point
+│   ├── test_pricing_plan_try_now.py  # Pricing TRY NOW/BUY NOW × 6 period×plan combos
 │   │
 │   │  ┌── Older / non-flozic tests ──┐
 │   ├── test_create_connect_workflow.py
@@ -119,6 +134,11 @@ automate-workflow-py/
 │   ├── test_top_app_combinations.py
 │   ├── test_trending_app_integrations.py
 │   │  └─────────────────────────────────────────────────────┘
+│   │
+│   ├── unit/                         # Unit / schema regression tests
+│   │   ├── __init__.py
+│   │   ├── test_network_schema.py    # Golden-file regression for network artifact schema v1
+│   │   └── fixtures/golden/          # Checked-in golden JSON for schema comparison
 │   │
 │   └── marketing/                    # Homepage / pricing tests
 │       ├── __init__.py
@@ -183,6 +203,13 @@ automate-workflow-py/
 │   ├── ai_pr_review.py               # Static analysis on git diff
 │   ├── ai_page_object.py             # DOM -> draft Page Object skeleton
 │   ├── ai_form_data.py               # Synthetic form data, validate-before-cache
+│   ├── ai_popup_validator.py         # PlanChangeService popup vs business matrix (vision)
+│   │  └─────────────────────────────────────────────────────┘
+│   │
+│   │  ┌── Network observability ──┐
+│   ├── network_monitor.py            # Per-page HTTP capture (NetworkMonitor / NetworkExporter /
+│   │                                 #   NetworkAnalyzer). Writes network-summary.json +
+│   │                                 #   network-events.json into failure folders.
 │   │  └─────────────────────────────────────────────────────┘
 │   │
 │   │  ┌── Reporting ──┐
@@ -194,7 +221,8 @@ automate-workflow-py/
 ├── scripts/                          # ── Stand-alone CLIs ──
 │   ├── promote_baseline.py           # Move canvas.png -> baselines/<test>/
 │   ├── ai_pr_review.py               # Wrapper around utils/ai_pr_review.py
-│   └── generate_page_object.py       # Wrapper around utils/ai_page_object.py
+│   ├── generate_page_object.py       # Wrapper around utils/ai_page_object.py
+│   └── validate_network_artifacts.py # Sprint-1 acceptance test for network observability
 │
 ├── baselines/                        # ── Tracked in git (intentional) ──
 │   └── <test_method>/canvas.png      # Visual-regression baselines
@@ -283,7 +311,7 @@ SKIPPED with a logged reason.
 
 | Module | Input | Output | Cost/run |
 |---|---|---|---|
-| `ai_prompt_generator` | App slug + N | List of varied prompts | ~$0.02 × 9 apps = $0.18 |
+| `ai_prompt_generator` | App slug + N | List of varied prompts | ~$0.02 × 15 apps = $0.30 |
 | `ai_validator` | Canvas PNG + user prompt | VALID/INVALID + reasoning | ~$0.015 per test |
 | `ai_triage` | Screenshot + DOM + traceback | Category + severity + diagnosis + suggested fix | ~$0.02 per failure |
 | `ai_visual_diff` | Current PNG vs baseline PNG | IDENTICAL/COSMETIC/REGRESSION/UNKNOWN | ~$0.025 (skipped if bytes identical) |
@@ -291,6 +319,7 @@ SKIPPED with a logged reason.
 | `ai_pr_review` | Git diff | List of findings per file | ~$0.05 per file |
 | `ai_page_object` | DOM HTML | Draft Page Object .py file | ~$0.10 per generation |
 | `ai_form_data` | Schema spec + N | N validated rows | ~$0.05 per 50 rows |
+| `ai_popup_validator` | Popup screenshot + current plan + target plan | Category match verdict (VALID/INVALID) + reasoning | ~$0.015 per pricing flow test |
 
 Total cost per full run (37 tests × validation + triage on failures +
 prompt generation + exec summary): **~$0.50–$0.80 at gpt-4o pricing**.
@@ -359,6 +388,29 @@ All pure vanilla JS, no dependencies. Works offline from `file://`.
 | `pdf_report_builder.py` | Writes `reports/trend/report-printable.html`. If `weasyprint` is installed, generates a real `.pdf`. |
 | `snapshot_writer.py` | Marshals in-memory `TestRecord`s to the snapshot JSON. Schema-versioned for future migrations. |
 | `error_clusterer.py` | Groups JS console errors *within a single run* by fingerprint. Different from `failure_clustering.py`, which groups across runs. |
+
+### 4.8 Network observability — `utils/network_monitor.py`
+
+Three focused classes with independent lifecycles:
+
+- **`NetworkMonitor`** — attaches to a Playwright `Page` before the first
+  navigation and accumulates request/response events in memory. Enforces
+  the capture policy: full headers + body (up to 2 KB) for `fetch/xhr/document`;
+  metadata-only for static assets; bodies and headers always redacted on
+  sensitive URLs (login, OAuth, payment).
+- **`NetworkExporter`** — at teardown, writes two files into the failure
+  folder: `network-summary.json` (counts, slowest requests, failures — human-
+  readable, ages well) and `network-events.json` (every retained event, raw).
+  Both carry `schema_version=1`; dashboards refuse to render on version mismatch.
+- **`NetworkAnalyzer`** — stateless; call it on any event list to get latency
+  stats (min/avg/P95/max), status-code distribution, and error summary. Used
+  by `NetworkExporter` and by the dashboard.
+
+Schema stability is enforced by `tests/unit/test_network_schema.py`, a golden-
+file regression that catches any inadvertent on-disk format changes. To
+intentionally change the schema: bump `SCHEMA_VERSION` in `network_monitor.py`,
+regenerate the golden fixtures (instructions in the test docstring), and
+re-run the test.
 
 ---
 
@@ -477,16 +529,29 @@ source control beyond `pytest.ini` and `requirements.txt`.
 | `scripts/promote_baseline.py <test_id ...>` | Move `reports/recordings/<test_id>/canvas.png` → `baselines/<test_id>/canvas.png`. `--all` for first-run-state seed. `--list` for status. |
 | `scripts/ai_pr_review.py [--base main]` | Run GPT review on `git diff`. Writes `reports/pr_review_<sha>.md`. Always exits 0 unless `--strict` + a blocker finding. |
 | `scripts/generate_page_object.py <url-or-html> [--name FooPage]` | Draft a Page Object from a URL or HTML file. Output goes to `pages/<snake>_page.new.py` (never overwrites). |
+| `scripts/validate_network_artifacts.py` | Sprint-1 acceptance test for the network-observability layer. Reads the most-recent run's artifacts and verifies: latency invariants, event-ID contiguity, redaction, request/response accounting, and feature-flag off/on behaviour. |
 
 ---
 
 ## 8. Run modes (typical commands)
 
 ```powershell
-# ── Smoke (10 hardcoded apps, ~5 min) ──
-python -m pytest (Get-ChildItem tests/test_flozic_*.py -Exclude _*,test_flozic_diversified.py).FullName --headed -v
+# ── Smoke: 15 hardcoded apps (~7 min) ──
+python -m pytest (Get-ChildItem tests/test_flozic_*.py -Exclude _*,test_flozic_diversified.py,test_flozic_agent_*.py).FullName --headed -v
 
-# ── Full diversified (37 tests = 10 hardcoded + 27 GPT-generated, ~30 min) ──
+# ── Agent bot tests (5 tests) ──
+python -m pytest tests/test_flozic_agent_*.py --headed -v
+
+# ── loop.flozic.ai flow-builder test ──
+python -m pytest tests/test_flozic_flow_by_automate.py --headed -v
+
+# ── Pricing TRY NOW / BUY NOW (6 period×plan combos) ──
+python -m pytest tests/test_pricing_plan_try_now.py --headed -v
+
+# ── Unit / schema regression (no browser) ──
+python -m pytest tests/unit/ -v
+
+# ── Full diversified (45 tests = 15 hardcoded + 30 GPT-generated, ~35 min) ──
 $env:OPENAI_API_KEY = "sk-..."
 $env:OPENAI_MODEL   = "gpt-4o"
 python -m pytest (Get-ChildItem tests/test_flozic_*.py -Exclude _*).FullName --headed -v
@@ -499,24 +564,29 @@ python scripts/promote_baseline.py --all
 
 # ── PR review locally ──
 python scripts/ai_pr_review.py --base main
+
+# ── Validate network observability artifacts ──
+python scripts/validate_network_artifacts.py
 ```
 
 ---
 
 ## 9. Cost model
 
-Per **full diversified run** (37 tests) at gpt-4o pricing (USD):
+Per **full diversified run** (~45 tests = 15 hardcoded + 30 GPT-generated) at gpt-4o pricing (USD):
 
 | Phase | Calls | Per call | Subtotal |
 |---|---:|---:|---:|
-| Prompt generation (9 apps × 1 batched call) | 9 | $0.02 | $0.18 |
-| Canvas validation (per test) | 37 | $0.015 | $0.56 |
+| Prompt generation (15 apps × 1 batched call) | 15 | $0.02 | $0.30 |
+| Canvas validation (per flozic-app test) | 45 | $0.015 | $0.68 |
+| Popup validation (pricing TRY NOW × 6 combos) | 6 | $0.015 | $0.09 |
 | Failure triage (per FAIL, ~5/run) | 5 | $0.020 | $0.10 |
 | Visual diff (IDENTICAL = free; only mismatches call GPT) | ~3 | $0.025 | $0.08 |
 | Executive summary (once) | 1 | $0.010 | $0.01 |
-| **Total** | | | **~$0.93** |
+| **Total** | | | **~$1.26** |
 
-Smoke run (no diversified): **~$0.15** per run.
+Smoke run (15 hardcoded apps only, no diversified): **~$0.30** per run.
+Agent bot tests: **~$0.10** per run (no canvas validation; triage on failures only).
 
 Set `FLOZIC_USE_PROMPT_CACHE=true` to cut prompt-generation cost to
 ~$0.02/run after the first.
@@ -601,6 +671,13 @@ wrong — that's a product issue, not a test code issue.
   (referenced in the older Java-era backlog; not ported to Python yet).
 - **TypedAssert + assertion classification** for finer-grained
   test-vs-product attribution.
+- **Dashboard network panel.** `network_monitor.py` writes artifacts per
+  failure but the dashboard does not yet render latency/error summaries.
+  Sprint 2 target.
+- **Pricing popup matrix expansion.** `test_pricing_plan_try_now.py`
+  currently assumes the test account is on ENTERPRISE. Parametrising
+  account plan (via `FLOZIC_CURRENT_PLAN`) to cover all 6 × 6 combinations
+  is deferred.
 
 See `docs/risk-register.md` and `docs/observation-protocol.md` for the
 backlog of items inherited from the Java-era framework.
@@ -623,5 +700,6 @@ backlog of items inherited from the Java-era framework.
 
 ---
 
-*Last updated: this file is regenerated by hand. When the structure
-changes, update Section 3 (folder tree) and Section 5 (data-flow).*
+*Last updated: 2026-06-26. When the structure changes, update Section 3
+(folder tree), Section 4 (subsystem responsibilities), and Section 5
+(data-flow).*

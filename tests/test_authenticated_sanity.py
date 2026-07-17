@@ -85,8 +85,8 @@ class TestAuthenticatedSanityJourney:
 
         # Step 5: Logout and verify redirect
         dashboard.click_logout()
-        assert "accounts.appypie.com" in page.url, (
-            f"Did not redirect to accounts.appypie.com after logout. URL: {page.url}"
+        assert ("authv2.flozic.ai" in page.url or "accounts.appypie.com" in page.url), (
+            f"Did not redirect to a login page after logout. URL: {page.url}"
         )
         logger.info("Step 5 DONE: Logout successful — redirected to: %s", page.url)
         logger.info("=== Sanity Journey PASSED ===  (business outcome: SUCCESS)")
