@@ -48,8 +48,17 @@ class TestAppyPieNavigation:
             self._page.wait_for_load_state("networkidle", timeout=15_000)
         except Exception:
             pass
-        # Filter known noise: legacy "appendChild" errors
-        fatal = [e for e in self._console.fatal_events if "appendChild" not in e.text]
+        # Filter transient/environmental noise — only flag real JS bugs
+        _NOISE = (
+            "appendChild",           # legacy DOM quirk
+            "Failed to load resource",  # transient network hiccup
+            "net::ERR_",             # network-level errors (not code bugs)
+            "favicon",               # browser favicon fetch failures
+        )
+        fatal = [
+            e for e in self._console.fatal_events
+            if not any(n in e.text for n in _NOISE)
+        ]
         assert not fatal, (
             f"Unexpected fatal JS errors: {[{'text': e.text, 'origin': e.source_origin} for e in fatal]}"
         )

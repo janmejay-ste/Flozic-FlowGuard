@@ -30,20 +30,11 @@ if not DEFAULT_EMAIL or not DEFAULT_PASSWORD:
         "Set both env vars (or a gitignored .env) to enable automated login."
     )
 
-# Standard login URL that redirects to the Connect dashboard after auth.
-LOGIN_URL = (
-    "https://accounts.appypie.com/login"
-    "?frompage=https:%2F%2Fconnectcloud.appypie.com%2Fconnects"
-    "&website=https:%2F%2Fconnectcloud.appypie.com"
-)
+# Entry-point URL for unauthenticated navigation. The server redirects to
+# authv2.flozic.ai/login (Cognito) when the session is missing — we never
+# land on accounts.appypie.com/login directly.
+LOGIN_URL = "https://loop.flozic.ai/connects"
 
-# The login URL contains "connectcloud.appypie.com" in its `frompage`
-# query string, so a bare `**connectcloud.appypie.com**` glob falsely
-# matches the login page itself. Require the path component too.
-#
-# Partial-migration window: `loop.flozic.ai` is the new host, but the
-# legacy `connectcloud.appypie.com` host is still in use. Accept both via
-# a callable predicate (Playwright wait_for_url accepts str | regex | callable).
 def _post_login_url_matches(url: str) -> bool:
     if not url:
         return False

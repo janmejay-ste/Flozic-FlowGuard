@@ -61,9 +61,9 @@ class TestHomepageFunctional:
 
     def test_header_login_routes_to_auth_domain(self) -> None:
         self._home.header().click_login()
-        _wait_for_url_contains(self._page, "accounts.appypie", "login")
+        _wait_for_url_contains(self._page, "authv2.flozic.ai", "accounts.appypie", "/login")
         url = self._page.url
-        assert "accounts.appypie" in url or "/login" in url, (
+        assert "authv2.flozic.ai" in url or "accounts.appypie" in url or "/login" in url, (
             f"Header login did not route to auth domain. Final: {url}"
         )
 

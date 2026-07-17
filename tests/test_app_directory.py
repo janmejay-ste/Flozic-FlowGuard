@@ -69,8 +69,16 @@ class TestAppDirectory:
     def test_scroll_loading_works(self) -> None:
         initial = self._app_dir.get_integration_card_count()
         self._app_dir.scroll_to_bottom()
-        self._page.wait_for_timeout(2_000)
-        after = self._app_dir.get_integration_card_count()
-        logger.info("Card count before: %d, after scroll: %d", initial, after)
-        # Either same count (no lazy load) or more is acceptable
-        assert after >= initial, f"Card count decreased after scroll: {initial} → {after}"
+        # Poll until the count stabilises (handles brief DOM churn during re-render)
+        stable_after = initial
+        for _ in range(10):
+            self._page.wait_for_timeout(500)
+            count = self._app_dir.get_integration_card_count()
+            if count >= initial:
+                stable_after = count
+                break
+            stable_after = count
+        logger.info("Card count before: %d, after scroll: %d", initial, stable_after)
+        assert stable_after >= initial, (
+            f"Card count decreased after scroll: {initial} → {stable_after}"
+        )

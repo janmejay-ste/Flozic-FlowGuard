@@ -17,14 +17,15 @@ from playwright.sync_api import Page
 
 
 def is_on_idp(page: Page) -> bool:
-    """True iff current URL is on the appypie auth IdP host."""
-    return "accounts.appypie.com" in (page.url or "")
+    """True iff current URL is on a recognised auth IdP host."""
+    url = page.url or ""
+    return "accounts.appypie.com" in url or "authv2.flozic.ai" in url
 
 
 def is_on_auth_route(page: Page) -> bool:
-    """True iff URL contains /login or /signup somewhere."""
+    """True iff URL contains a recognised auth path segment."""
     url = (page.url or "").lower()
-    return "/login" in url or "/signup" in url
+    return "/login" in url or "/signup" in url or "/register" in url
 
 
 def has_session(page: Page) -> bool:

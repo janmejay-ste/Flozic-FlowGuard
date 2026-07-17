@@ -1432,12 +1432,13 @@ def _render_login_routes_section() -> str:
             badge = ("<span style='background:#f1f5f9;color:#475569;"
                      "padding:2px 8px;border-radius:10px;font-size:11px;"
                      "font-weight:600'>UNKNOWN</span>")
-        short_url = (url[:80] + "…") if len(url) > 80 else url
         rows.append(
             f"<tr>"
-            f"<td style='padding:6px 12px;font-family:monospace;font-size:12px'>{test_name}</td>"
-            f"<td style='padding:6px 12px'>{badge}</td>"
-            f"<td style='padding:6px 12px;font-family:monospace;font-size:11px;color:#64748b'>{short_url}</td>"
+            f"<td style='padding:6px 12px;font-family:monospace;font-size:12px;"
+            f"overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{test_name}</td>"
+            f"<td style='padding:6px 12px;white-space:nowrap'>{badge}</td>"
+            f"<td style='padding:6px 12px;font-family:monospace;font-size:11px;color:#64748b;"
+            f"overflow:hidden;text-overflow:ellipsis;white-space:nowrap' title='{url}'>{url}</td>"
             f"</tr>"
         )
 
@@ -1449,14 +1450,21 @@ def _render_login_routes_section() -> str:
           flozic authv2: <b style="color:#15803d">{flozic_count}</b>
         </span>
       </h2>
-      <table style="width:100%;border-collapse:collapse">
+      <div style="overflow-x:auto">
+      <table style="width:100%;border-collapse:collapse;table-layout:fixed">
+        <colgroup>
+          <col style="width:44%">
+          <col style="width:18%">
+          <col style="width:38%">
+        </colgroup>
         <thead><tr style="background:#f8fafc">
-          <th style="text-align:left;padding:8px 12px">Test</th>
-          <th style="text-align:left;padding:8px 12px">Route</th>
-          <th style="text-align:left;padding:8px 12px">URL at login</th>
+          <th style="text-align:left;padding:8px 12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Test</th>
+          <th style="text-align:left;padding:8px 12px;white-space:nowrap">Route</th>
+          <th style="text-align:left;padding:8px 12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">URL at Login</th>
         </tr></thead>
         <tbody>{''.join(rows)}</tbody>
       </table>
+      </div>
     </div>
     """
 
