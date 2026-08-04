@@ -1,17 +1,23 @@
 """
 AI-based validation of the connect-creation canvas.
 
-Sends a canvas screenshot to OpenAI's vision-capable chat model and asks
-whether the workflow on the canvas matches what the user's prompt requested.
+Sends a canvas screenshot to a vision-capable LLM (Claude or OpenAI —
+provider selected by env vars, see utils/ai_provider.py) and asks whether
+the workflow on the canvas matches what the user's prompt requested.
 Returns a structured verdict (valid + reasoning) that the test can act on.
 
 Environment:
-  OPENAI_API_KEY  — required. If absent, `validate_canvas_with_ai()` returns
-                    a 'SKIPPED' verdict so the caller can fall back.
-  OPENAI_MODEL    — optional. Default 'gpt-5.4' to match the project's
-                    CLAUDE.md. Caller can override per call.
+  ANTHROPIC_API_KEY  — enables Claude (preferred if set).
+  OPENAI_API_KEY     — enables OpenAI (fallback / legacy).
+  FLOZIC_AI_PROVIDER — force one provider: "claude" or "openai".
+  CLAUDE_MODEL       — override Claude model (default: claude-sonnet-5).
+  OPENAI_MODEL       — override OpenAI model (default: gpt-4o).
 
-JSON contract returned by the model (enforced via response_format=json_object):
+If no provider is configured, `validate_canvas_with_ai()` returns a
+'SKIPPED' verdict so the caller can fall back to the text-based copilot
+check.
+
+JSON contract enforced via provider's structured-output mode:
   {
     "is_valid": true|false,
     "trigger_app": "Housecall Pro",
@@ -23,7 +29,6 @@ JSON contract returned by the model (enforced via response_format=json_object):
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -32,10 +37,6 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
-API_BASE = "https://api.openai.com/v1/chat/completions"
-REQUEST_TIMEOUT_S = 60
 
 
 @dataclass
@@ -52,7 +53,9 @@ class AIValidationResult:
 
 
 def _encode_image(path: Path) -> str:
-    """Read PNG → base64 data URL ready for the chat-completions API."""
+    """Deprecated: base64-encoded data URL. Provider abstraction now
+    handles image encoding per-provider. Retained for any external caller."""
+    import base64
     b64 = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:image/png;base64,{b64}"
 
@@ -117,34 +120,6 @@ def validate_canvas_with_ai(
                                verdict_output_path, e)
         return result
 
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        logger.info(
-            "[AI] OPENAI_API_KEY not set — skipping AI validation. "
-            "Set the env var to enable vision-based canvas verification."
-        )
-        return _persist(AIValidationResult(
-            status="SKIPPED",
-            is_valid=False,
-            reasoning="OPENAI_API_KEY not set; AI validation skipped.",
-        ))
-
-    # Defer the requests import so this module is importable on machines
-    # without the requests package (e.g. the homepage_links tests' env).
-    try:
-        import requests  # type: ignore
-    except ImportError:
-        logger.error(
-            "[AI] 'requests' package not installed. Install with: "
-            "pip install requests"
-        )
-        return _persist(AIValidationResult(
-            status="ERROR",
-            is_valid=False,
-            reasoning="'requests' not installed.",
-            error="ModuleNotFoundError: requests",
-        ))
-
     if not screenshot_path.exists():
         return _persist(AIValidationResult(
             status="ERROR",
@@ -153,60 +128,45 @@ def validate_canvas_with_ai(
             error="FileNotFoundError",
         ))
 
-    payload = {
-        "model": model or DEFAULT_MODEL,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _build_prompt(user_prompt, expected_trigger)},
-                    {"type": "image_url",
-                     "image_url": {"url": _encode_image(screenshot_path)}},
-                ],
-            }
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-    }
-
-    try:
-        resp = requests.post(
-            API_BASE, json=payload, headers=headers, timeout=REQUEST_TIMEOUT_S
+    # Provider-agnostic send. Either Claude or OpenAI depending on env vars.
+    # See utils/ai_provider.py for the selection rules. Missing keys return
+    # AIResponse(provider='noop', error=…) — mapped to SKIPPED below.
+    from utils.ai_provider import send as ai_send, PROVIDER_NAME
+    if PROVIDER_NAME == "noop":
+        logger.info(
+            "[AI] No AI provider configured (set ANTHROPIC_API_KEY or "
+            "OPENAI_API_KEY) — skipping AI validation."
         )
-    except Exception as e:
-        logger.error("[AI] OpenAI request failed: %s", e)
         return _persist(AIValidationResult(
-            status="ERROR", is_valid=False,
-            reasoning=f"OpenAI request failed: {e}", error=str(e),
+            status="SKIPPED",
+            is_valid=False,
+            reasoning="No AI provider configured; AI validation skipped.",
         ))
 
-    if resp.status_code != 200:
-        body = resp.text[:500]
-        logger.error("[AI] OpenAI returned %d: %s", resp.status_code, body)
+    resp = ai_send(
+        _build_prompt(user_prompt, expected_trigger),
+        model=model,
+        image_paths=[screenshot_path],
+        response_json=True,
+        temperature=0.0,
+    )
+    if resp.error:
+        logger.error("[AI] %s validator request failed: %s",
+                     resp.provider, resp.error)
         return _persist(AIValidationResult(
             status="ERROR", is_valid=False,
-            reasoning=f"OpenAI HTTP {resp.status_code}",
-            error=body,
+            reasoning=f"{resp.provider} error: {resp.error}",
+            error=resp.error,
         ))
-
-    try:
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        if content is None or not isinstance(content, str):
-            raise ValueError(
-                f"OpenAI returned empty/non-string content (type={type(content).__name__})"
-            )
-        parsed: dict[str, Any] = json.loads(content)
-    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
-        logger.error("[AI] Could not parse OpenAI response: %s", e)
+    if resp.parsed_json is None:
+        logger.error("[AI] %s returned non-JSON response. Raw text: %r",
+                     resp.provider, (resp.text or "")[:200])
         return _persist(AIValidationResult(
             status="ERROR", is_valid=False,
-            reasoning=f"Could not parse model output: {e}",
-            error=str(e),
+            reasoning=f"{resp.provider} returned non-JSON output",
+            error="ResponseParseError",
         ))
+    parsed = resp.parsed_json
 
     is_valid = bool(parsed.get("is_valid", False))
     reasoning = str(parsed.get("reasoning", "")).strip() or "(no reasoning given)"
