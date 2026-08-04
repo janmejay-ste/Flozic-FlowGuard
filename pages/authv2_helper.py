@@ -72,6 +72,30 @@ def handle_authv2_login_if_present(
         logger.info("authv2 already past login form (URL=%s) — skipping.", current_url)
         return False
 
+    # Signup-page guard: some flows (notably the conversational-agent OAuth)
+    # land on authv2.flozic.ai/signup instead of /login. Filling the signup
+    # form as if it were a login would hang because the field/next-button
+    # semantics differ. Detect signup, click the "Sign in" link to flip to
+    # /login, then continue the normal credential submit. This handles the
+    # product bug where /agent/builder redirects to signup post-OAuth.
+    if "/signup" in current_url:
+        logger.warning(
+            "[ISSUE] authv2 landed on /signup instead of /login (URL=%s). "
+            "Attempting signup→login switch before submitting credentials.",
+            current_url,
+        )
+        # Import lazily to avoid a circular dependency at module load time.
+        from pages.signup_to_login_switch import switch_signup_to_login_if_needed
+        switched = switch_signup_to_login_if_needed(
+            page, app_key="authv2", timeout_ms=step_timeout_ms,
+        )
+        if not switched:
+            logger.error(
+                "authv2 was on /signup but the switch to /login failed. "
+                "Cannot proceed with credential submit. URL: %s", page.url,
+            )
+            return False
+
     logger.info("On authv2 Cognito login (%s). Submitting credentials.", page.url)
 
     # ── Step 1: username ─────────────────────────────────────────────────────

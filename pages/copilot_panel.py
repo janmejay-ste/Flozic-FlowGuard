@@ -55,7 +55,7 @@ class CopilotPanel:
 
     def verify_trigger(self, expected_trigger: str, timeout_ms: int = 120_000) -> bool:
         """
-        Wait for 'Connect created!' message, return True iff the expected
+        Wait for 'Connect created!' message, return True if the expected
         trigger app name is mentioned in it.
         """
         text = self.wait_for_connect_created(timeout_ms=timeout_ms)
