@@ -1,7 +1,31 @@
-playwright>=1.49.0
-pytest>=8.3.0
-pytest-xdist>=3.6.0
+# Flozic FlowGuard — Python dependencies
+# Install:  pip install -r requirements.txt
+# Then:     playwright install chromium      (browser binary, not a pip package)
+#
+# Versions after each package are what this project is verified against
+# (Python 3.11.15, macOS, 2026-08-07).
 
-# Optional: PDF report generation (requires GTK+ on Windows — see docs/pdf-setup.md)
-# Install with: pip install weasyprint
+# ── Core: browser automation + test runner ──
+playwright>=1.49.0          # verified 1.62.0
+pytest>=8.3.0               # verified 9.1.1
+pytest-xdist>=3.6.0         # verified 3.8.0
+
+# ── HTTP ──
+# Required, not optional. Imported at module scope by the link-checker tests
+# (tests/test_homepage_links.py, tests/test_homepage_exhaustive.py,
+# tests/marketing/test_pricing_links.py), so a venv without it fails at
+# COLLECTION and interrupts the whole run. Also the OpenAI transport in
+# utils/ai_provider.py.
+requests>=2.31.0            # verified 2.34.2
+
+# ── AI provider: Claude ──
+# Needed for FLOZIC_AI_PROVIDER=claude / ANTHROPIC_API_KEY (the preferred
+# provider). Unused on the OpenAI path, but small and pure-Python, so it is
+# installed by default rather than left as an undocumented extra step.
+anthropic>=0.40.0           # verified 0.120.2
+
+# ── Optional ──
+# PDF report generation. Without it, pdf_report_builder still writes
+# report-printable.html and logs a skip — nothing fails.
+# Needs GTK+ on Windows; see docs/pdf-setup.md
 # weasyprint>=62.3

@@ -10,33 +10,96 @@ whether the popup category matches the business-logic matrix.
 Returns the same AIValidationResult shape as utils.ai_validator so the
 dashboard can render popup verdicts identically to canvas verdicts.
 
-JSON contract (enforced via response_format=json_object):
+Provider-agnostic — Claude or OpenAI, selected by env vars. See
+utils/ai_provider.py for the selection rules.
+
+The model REPORTS observations; this module DECIDES the verdict.
+
+That split is deliberate and was learned the hard way. The prompt used to ask
+the model for an `is_valid` boolean defined as "true iff categories match AND
+plan names correctly mentioned" — a logical conjunction over four fields the
+model was already reporting separately. On the 2026-08-11 run all six pricing
+variants produced byte-identical observations:
+
+    expected=BLOCK observed=BLOCK match=True current=True target=False
+
+...and the model returned is_valid=true for three of them and false for the
+other three. Same evidence, opposite verdicts, at temperature=0. Three tests
+failed as "product bugs" on a coin flip.
+
+A deterministic boolean must not come from a sampler. The model now returns
+only what it can observe in the popup text; `_decide()` below applies the
+policy in Python, so identical evidence always yields an identical verdict
+and the rule itself is reviewable in a diff.
+
+JSON contract (from the model — note: no is_valid):
   {
-    "is_valid":            true|false,
-    "expected_category":   "BLOCK" | "CONFIRM_TRIAL" | "CONFIRM_PAID" | ...,
-    "observed_category":   "BLOCK" | ...,
-    "categories_match":    true|false,
-    "popup_mentions_target": true|false,
+    "expected_category":     "BLOCK" | "CONFIRM_TRIAL" | "CONFIRM_PAID" | ...,
+    "observed_category":     "BLOCK" | ...,
+    "popup_mentions_target":  true|false,
     "popup_mentions_current": true|false,
-    "reasoning":           "<one sentence>"
+    "reasoning":             "<one sentence>"
   }
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
-import os
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
-API_BASE = "https://api.openai.com/v1/chat/completions"
-REQUEST_TIMEOUT_S = 30
+MODULE = "ai_popup_validator"
+
+# ── Verdict policy ─────────────────────────────────────────────────────
+#
+# Which plan names a popup must name, by category. A BLOCK says "you cannot
+# leave your current plan" — naming the CURRENT plan is the substance of the
+# message; naming the target adds nothing and the product does not do it.
+# Requiring it was what made the old rule fail on correct popups.
+#
+# A CONFIRM/CHECKOUT is the opposite: the user is about to move ONTO the
+# target plan, so the target must be named or the confirmation is ambiguous.
+
+_REQUIRES_CURRENT_MENTION = {
+    "BLOCK", "BLOCK_PERIOD", "CONFIRM_TRIAL", "CONFIRM_PAID",
+    "CONFIRM_SWITCH_YEARLY", "SAME",
+}
+_REQUIRES_TARGET_MENTION = {
+    "CONFIRM_TRIAL", "CONFIRM_PAID", "CONFIRM_SWITCH_YEARLY", "CHECKOUT",
+}
+
+
+def _decide(parsed: dict) -> tuple[bool, list[str]]:
+    """
+    Apply the verdict policy to the model's observations.
+
+    Returns `(is_valid, failure_reasons)`. Pure function of `parsed` — no
+    sampling, no I/O — so the same popup always produces the same verdict.
+    """
+    expected = str(parsed.get("expected_category", "")).strip().upper()
+    observed = str(parsed.get("observed_category", "")).strip().upper()
+    mentions_current = bool(parsed.get("popup_mentions_current", False))
+    mentions_target = bool(parsed.get("popup_mentions_target", False))
+
+    reasons: list[str] = []
+
+    if not expected or not observed:
+        reasons.append(
+            f"could not determine categories (expected={expected or '?'}, "
+            f"observed={observed or '?'})"
+        )
+    elif expected != observed:
+        reasons.append(f"category mismatch: expected {expected}, got {observed}")
+
+    if observed in _REQUIRES_CURRENT_MENTION and not mentions_current:
+        reasons.append(f"{observed} popup does not name the current plan")
+    if observed in _REQUIRES_TARGET_MENTION and not mentions_target:
+        reasons.append(f"{observed} popup does not name the target plan")
+
+    return (not reasons), reasons
 
 
 @dataclass
@@ -52,54 +115,6 @@ class AIValidationResult:
         return json.dumps(asdict(self), indent=2)
 
 
-# Full PlanChangeService business-logic matrix as model context. The matrix
-# is the contract — if the model needs to know *why* BLOCK is correct for
-# a Standard click from an Enterprise account, this paragraph tells it.
-MATRIX_CONTEXT = """\
-Flozic plan tier order (lower → higher):
-    Standard (1) < Professional (2) < Business (3) < Enterprise (4)
-
-When a user clicks TRY NOW on the marketing pricing page, they're routed to
-/portal-payment-handler/<planId>/<cpId>/<period> which invokes PlanChangeService.
-The service decides which popup to show based on the user's current plan vs
-the target plan + period. The full decision matrix:
-
-  CURRENT = Free (new user):
-    target = Standard / Professional / Business → NO POPUP (proceeds to checkout)
-    target = Enterprise → CONTACT_US (opens Calendly)
-
-  CURRENT = Trial of any tier:
-    target = SAME tier → SAME ("already your current plan")
-    target = HIGHER tier → CONFIRM_TRIAL
-        ("You are currently on the X trial plan. Upgrading to / Purchasing the
-          selected plan will immediately end your trial and activate the new
-          plan. Do you want to continue?")
-    target = LOWER tier (yearly section) → BLOCK
-        ("Downgrading to a lower plan is not allowed while your X trial is
-          active. Please continue using your current plan or contact Support
-          for assistance.")
-    target = LOWER tier (monthly section) → CONFIRM_PAID (special case — allowed)
-    target = Enterprise → CONTACT_US
-
-  CURRENT = Paid (any tier, yearly or monthly):
-    target = SAME tier + SAME period → SAME
-    target = SAME tier, monthly→yearly → CONFIRM_SWITCH_YEARLY
-    target = SAME tier, yearly→monthly → BLOCK_PERIOD
-        ("Switching from a yearly to a monthly plan is not allowed…")
-    target = HIGHER tier → CONFIRM_PAID
-        ("You are currently subscribed to the X period plan. Purchasing the
-          selected plan will cancel your current plan and activate the new
-          plan immediately…")
-    target = LOWER tier → BLOCK
-    target = Enterprise → CONTACT_US
-
-Test-account state: janmejay@appypiellp.com is on ENTERPRISE (highest tier).
-Therefore every Standard / Professional / Business click is a DOWNGRADE and
-should produce BLOCK with .pcc-title = "Downgrade not allowed" and a message
-that says the Enterprise plan is active.
-"""
-
-
 def _build_prompt(
     popup_title:        str,
     popup_message:      str,
@@ -110,39 +125,19 @@ def _build_prompt(
     target_plan:        str,
     target_period:      str,
 ) -> str:
-    return (
-        "You are validating a PlanChangeService popup from the flozic.ai "
-        "pricing flow.\n\n"
-        + MATRIX_CONTEXT
-        + "\n\nObservation from this test run:\n"
-        f"  Current plan:           {current_plan}\n"
-        f"  Target plan (clicked):  {target_plan}\n"
-        f"  Target period:          {target_period}\n"
-        f"  Page-object classifier guess:  {page_classifier}\n"
-        "\nPopup as captured from the DOM:\n"
-        f"  .pcc-title:           {popup_title!r}\n"
-        f"  .pcc-message:         {popup_message!r}\n"
-        f"  primary action button:    {popup_primary!r}\n"
-        f"  secondary action button:  {popup_secondary!r}\n"
-        "\nDecide:\n"
-        "  1. Given the matrix and the current account state, what category "
-        "SHOULD the popup be? (BLOCK / CONFIRM_TRIAL / CONFIRM_PAID / "
-        "CONFIRM_SWITCH_YEARLY / BLOCK_PERIOD / SAME / NO_POPUP / CONTACT_US)\n"
-        "  2. Given the captured text, what category did the product ACTUALLY "
-        "show?\n"
-        "  3. Do they match?\n"
-        "  4. Does the message correctly mention the user's current plan "
-        "(needed for BLOCK / CONFIRM_PAID / CONFIRM_TRIAL)?\n"
-        "  5. Does the message correctly mention the target plan?\n"
-        "\nReply with a SINGLE JSON object, no other text:\n"
-        "  is_valid (bool — true iff categories match AND plan names "
-        "correctly mentioned),\n"
-        "  expected_category (string),\n"
-        "  observed_category (string),\n"
-        "  categories_match (bool),\n"
-        "  popup_mentions_target (bool),\n"
-        "  popup_mentions_current (bool),\n"
-        "  reasoning (string, one sentence)."
+    """Deprecated shim — the template and the PlanChangeService matrix now
+    live in `utils.ai_prompts` under 'pricing_popup_validation'."""
+    from utils import ai_prompts
+    return ai_prompts.render(
+        "pricing_popup_validation",
+        current_plan=current_plan,
+        target_plan=target_plan,
+        target_period=target_period,
+        page_classifier=page_classifier,
+        popup_title=repr(popup_title),
+        popup_message=repr(popup_message),
+        popup_primary=repr(popup_primary),
+        popup_secondary=repr(popup_secondary),
     )
 
 
@@ -155,98 +150,87 @@ def validate_popup(
     verdict_output_path: Path | None = None,
 ) -> AIValidationResult:
     """
-    Send the captured popup to OpenAI for matrix-aware validation.
+    Send the captured popup for matrix-aware validation.
 
-    Returns SKIPPED when OPENAI_API_KEY is missing — caller should fall back
-    to the page-object classifier alone in that case.
+    Returns SKIPPED when no AI provider is configured — the caller falls
+    back to the page-object keyword classifier alone in that case.
     """
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        result = AIValidationResult(
-            status="SKIPPED", is_valid=False,
-            reasoning="OPENAI_API_KEY not set — popup validated by keyword "
-                      "classifier only.",
-        )
-        return _persist(result, verdict_output_path)
+    from utils import ai_prompts
+    from utils.ai_parser import send_json
+    from utils.ai_provider import PROVIDER_NAME
 
-    try:
-        import requests
-    except ImportError:
+    if PROVIDER_NAME == "noop":
         return _persist(AIValidationResult(
-            status="ERROR", is_valid=False,
-            reasoning="requests library not installed.",
-            error="ImportError: requests",
+            status="SKIPPED", is_valid=False,
+            reasoning="No AI provider configured — popup validated by "
+                      "keyword classifier only.",
         ), verdict_output_path)
 
-    model = model or DEFAULT_MODEL
-    prompt = _build_prompt(
-        popup_title=snapshot.title,
-        popup_message=snapshot.message,
-        popup_primary=snapshot.primary_action,
-        popup_secondary=snapshot.secondary_action,
-        page_classifier=snapshot.category_guess,
+    prompt = ai_prompts.render(
+        "pricing_popup_validation",
         current_plan=current_plan,
         target_plan=target_plan,
         target_period=target_period,
+        page_classifier=snapshot.category_guess,
+        popup_title=repr(snapshot.title),
+        popup_message=repr(snapshot.message),
+        popup_primary=repr(snapshot.primary_action),
+        popup_secondary=repr(snapshot.secondary_action),
     )
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"},
-        "temperature": 0,
+
+    parsed, resp = send_json(prompt, module=MODULE, model=model)
+
+    if resp is not None and resp.error:
+        logger.error("[AI-popup] %s request failed: %s", resp.provider, resp.error)
+        return _persist(AIValidationResult(
+            status="ERROR", is_valid=False,
+            reasoning=f"{resp.provider} request failed: {resp.error}",
+            error=resp.error,
+        ), verdict_output_path)
+
+    if not isinstance(parsed, dict):
+        logger.error("[AI-popup] Could not parse %s response as JSON.",
+                     resp.provider if resp else "provider")
+        return _persist(AIValidationResult(
+            status="ERROR", is_valid=False,
+            reasoning="Could not parse model output as JSON.",
+            error="ResponseParseError",
+        ), verdict_output_path)
+
+    # The verdict is computed here, not sampled — see the module docstring.
+    is_valid, failures = _decide(parsed)
+
+    model_reasoning = str(parsed.get("reasoning", "")).strip()
+    reasoning = model_reasoning if is_valid else "; ".join(failures)
+
+    # Record both the model's observations and the policy decision, so a
+    # verdict on the dashboard can be traced to the rule that produced it
+    # rather than to an opaque boolean.
+    raw = dict(parsed)
+    raw["_decision"] = {
+        "is_valid": is_valid,
+        "failures": failures,
+        "policy": {
+            "requires_current_mention": sorted(_REQUIRES_CURRENT_MENTION),
+            "requires_target_mention": sorted(_REQUIRES_TARGET_MENTION),
+        },
+        "model_reasoning": model_reasoning,
+        "decided_by": "utils.ai_popup_validator._decide",
     }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-    }
 
-    try:
-        resp = requests.post(
-            API_BASE, json=payload, headers=headers, timeout=REQUEST_TIMEOUT_S
-        )
-    except Exception as e:
-        logger.error("[AI-popup] OpenAI request failed: %s", e)
-        return _persist(AIValidationResult(
-            status="ERROR", is_valid=False,
-            reasoning=f"OpenAI request failed: {e}", error=str(e),
-        ), verdict_output_path)
-
-    if resp.status_code != 200:
-        body = resp.text[:500]
-        logger.error("[AI-popup] OpenAI %d: %s", resp.status_code, body)
-        return _persist(AIValidationResult(
-            status="ERROR", is_valid=False,
-            reasoning=f"OpenAI HTTP {resp.status_code}", error=body,
-        ), verdict_output_path)
-
-    try:
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        if content is None or not isinstance(content, str):
-            raise ValueError(
-                f"OpenAI returned empty/non-string content (type={type(content).__name__})"
-            )
-        parsed: dict[str, Any] = json.loads(content)
-    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
-        logger.error("[AI-popup] Could not parse OpenAI response: %s", e)
-        return _persist(AIValidationResult(
-            status="ERROR", is_valid=False,
-            reasoning=f"Could not parse model output: {e}", error=str(e),
-        ), verdict_output_path)
-
-    is_valid = bool(parsed.get("is_valid", False))
     result = AIValidationResult(
         status="VALID" if is_valid else "INVALID",
         is_valid=is_valid,
-        reasoning=parsed.get("reasoning", ""),
-        raw=parsed,
+        reasoning=reasoning,
+        raw=raw,
     )
     logger.info(
-        "[AI-popup] %s — expected=%s observed=%s match=%s reasoning=%s",
+        "[AI-popup] %s — expected=%s observed=%s current=%s target=%s | %s",
         result.status,
         parsed.get("expected_category"),
         parsed.get("observed_category"),
-        parsed.get("categories_match"),
+        parsed.get("popup_mentions_current"),
+        parsed.get("popup_mentions_target"),
         result.reasoning,
     )
     return _persist(result, verdict_output_path)

@@ -38,6 +38,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+MODULE = "ai_validator"
+
 
 @dataclass
 class AIValidationResult:
@@ -61,35 +63,13 @@ def _encode_image(path: Path) -> str:
 
 
 def _build_prompt(user_prompt: str, expected_trigger: str) -> str:
-    return (
-        "You are validating a no-code workflow editor screenshot.\n\n"
-        f"The user asked the AI builder to create this workflow:\n"
-        f"    \"{user_prompt}\"\n\n"
-        f"Expected trigger app: {expected_trigger}\n\n"
-        "Look at the canvas in the screenshot and tell me:\n"
-        "  1. Is a Trigger card visible with a real app name (not the "
-        "placeholder text 'Select Trigger App')?\n"
-        "  2. Are the Action card(s) visible with real app names (not "
-        "'Select Action App')?\n"
-        "  3. Does the trigger app shown match the expected one above?\n\n"
-        "IMPORTANT — judge LENIENTLY on event-name details:\n"
-        "  - Each integration only exposes a fixed list of trigger/action "
-        "events; the user's prompt may reference an event that doesn't "
-        "exist on that integration (e.g. 'New Lead' in HubSpot when only "
-        "'New Deal' is available; 'summarize' for ChatGPT when only "
-        "'Create image' / 'Create completion' are available).\n"
-        "  - If the trigger APP and action APPS match the user's intent, "
-        "treat the workflow as VALID even if the specific event picked is "
-        "the closest available rather than the exact one the user named. "
-        "Note the substitution in 'reasoning' but set is_valid=true.\n"
-        "  - Only set is_valid=false if a wrong APP is on the canvas, a "
-        "placeholder is still visible, or the substituted event is clearly "
-        "wrong (e.g. 'Delete Contact' picked when the prompt said 'Create "
-        "Contact').\n\n"
-        "Reply with a SINGLE JSON object, no other text, with keys:\n"
-        "  is_valid (bool), trigger_app (string), action_apps (list of "
-        "strings), placeholders_visible (bool), reasoning (string, one "
-        "sentence)."
+    """Deprecated shim — the template now lives in `utils.ai_prompts` under
+    'canvas_validation'. Retained so external callers keep working."""
+    from utils import ai_prompts
+    return ai_prompts.render(
+        "canvas_validation",
+        user_prompt=user_prompt,
+        expected_trigger=expected_trigger,
     )
 
 
@@ -131,7 +111,10 @@ def validate_canvas_with_ai(
     # Provider-agnostic send. Either Claude or OpenAI depending on env vars.
     # See utils/ai_provider.py for the selection rules. Missing keys return
     # AIResponse(provider='noop', error=…) — mapped to SKIPPED below.
-    from utils.ai_provider import send as ai_send, PROVIDER_NAME
+    from utils import ai_prompts
+    from utils.ai_parser import send_json
+    from utils.ai_provider import PROVIDER_NAME
+
     if PROVIDER_NAME == "noop":
         logger.info(
             "[AI] No AI provider configured (set ANTHROPIC_API_KEY or "
@@ -143,14 +126,17 @@ def validate_canvas_with_ai(
             reasoning="No AI provider configured; AI validation skipped.",
         ))
 
-    resp = ai_send(
-        _build_prompt(user_prompt, expected_trigger),
+    parsed, resp = send_json(
+        ai_prompts.render(
+            "canvas_validation",
+            user_prompt=user_prompt,
+            expected_trigger=expected_trigger,
+        ),
+        module=MODULE,
         model=model,
         image_paths=[screenshot_path],
-        response_json=True,
-        temperature=0.0,
     )
-    if resp.error:
+    if resp is not None and resp.error:
         logger.error("[AI] %s validator request failed: %s",
                      resp.provider, resp.error)
         return _persist(AIValidationResult(
@@ -158,15 +144,16 @@ def validate_canvas_with_ai(
             reasoning=f"{resp.provider} error: {resp.error}",
             error=resp.error,
         ))
-    if resp.parsed_json is None:
+    if not isinstance(parsed, dict):
         logger.error("[AI] %s returned non-JSON response. Raw text: %r",
-                     resp.provider, (resp.text or "")[:200])
+                     resp.provider if resp else "unknown",
+                     (resp.text if resp else "")[:200])
         return _persist(AIValidationResult(
             status="ERROR", is_valid=False,
-            reasoning=f"{resp.provider} returned non-JSON output",
+            reasoning=f"{resp.provider if resp else 'provider'} returned "
+                      "non-JSON output",
             error="ResponseParseError",
         ))
-    parsed = resp.parsed_json
 
     is_valid = bool(parsed.get("is_valid", False))
     reasoning = str(parsed.get("reasoning", "")).strip() or "(no reasoning given)"

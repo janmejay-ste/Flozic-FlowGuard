@@ -111,15 +111,26 @@ FlowGuard/
 │   ├── test_category.py           @test_category decorator
 │   ├── config.py
 │   │
-│   ├── ai_prompt_generator.py     GPT: workflow prompts per app
-│   ├── ai_validator.py            GPT vision: canvas vs prompt
-│   ├── ai_triage.py               GPT: failure root-cause classification
-│   ├── ai_visual_diff.py          GPT vision: semantic visual regression
-│   ├── ai_exec_summary.py         GPT: dashboard executive summary
-│   ├── ai_pr_review.py            GPT: code review on git diff
-│   ├── ai_page_object.py          GPT: Page Object scaffold from DOM
-│   ├── ai_form_data.py            GPT: synthetic form data (validate-before-cache)
-│   └── ai_popup_validator.py      GPT: PlanChangeService popup vs business matrix
+│   │
+│   │   ── AI layer. Every module below calls the provider, never an
+│   │      LLM HTTP endpoint directly (load-bearing decision #4).
+│   ├── ai_provider.py             Provider abstraction + cost metering +
+│   │                              budget gate. THE choke point — all AI
+│   │                              traffic goes through send().
+│   ├── claude_client.py           Anthropic Messages API transport
+│   ├── ai_prompts.py              Versioned prompt registry ($name templates)
+│   ├── ai_parser.py               Tolerant JSON + send_json()/send_text()
+│   ├── ai_cost_tracker.py         Per-call USD, module attribution, cap
+│   │
+│   ├── ai_prompt_generator.py     AI: workflow prompts per app
+│   ├── ai_validator.py            AI vision: canvas vs prompt
+│   ├── ai_triage.py               AI: failure root-cause classification
+│   ├── ai_visual_diff.py          AI vision: semantic visual regression
+│   ├── ai_exec_summary.py         AI: dashboard executive summary
+│   ├── ai_pr_review.py            AI: code review on git diff
+│   ├── ai_page_object.py          AI: Page Object scaffold from DOM
+│   ├── ai_form_data.py            AI: synthetic form data (validate-before-cache)
+│   └── ai_popup_validator.py      AI: PlanChangeService popup vs business matrix
 │
 ├── scripts/                       Stand-alone CLIs
 │   ├── promote_baseline.py        Promote canvas.png → baselines/

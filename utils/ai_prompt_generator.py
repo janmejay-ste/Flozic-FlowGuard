@@ -13,9 +13,11 @@ hardcoded prompts in tests/flozic_prompts.json. Enable per run by setting:
     FLOZIC_AI_PROMPT=true   ./.venv/Scripts/python.exe -m pytest ...
 
 Environment:
-  OPENAI_API_KEY   — required when FLOZIC_AI_PROMPT=true. Without it,
+  ANTHROPIC_API_KEY / OPENAI_API_KEY — one is required when
+                     FLOZIC_AI_PROMPT=true. Without either,
                      generate_prompt() falls back to the hardcoded config.
-  OPENAI_MODEL     — optional. Default 'gpt-5.4' (overridable).
+  CLAUDE_MODEL /
+  OPENAI_MODEL     — optional per-provider model override.
 
 JSON contract returned by the model:
   {
@@ -37,9 +39,25 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
-API_BASE = "https://api.openai.com/v1/chat/completions"
-REQUEST_TIMEOUT_S = 30
+MODULE = "ai_prompt_generator"
+
+
+def _default_model_label() -> str:
+    """Stable identifier for the model this run would use.
+
+    Only used as part of the on-disk cache key — swapping providers must
+    invalidate cached prompts, since the two models word things differently
+    and a cached OpenAI prompt shouldn't be attributed to a Claude run.
+    """
+    from utils.ai_provider import PROVIDER_NAME
+    if PROVIDER_NAME == "claude":
+        return os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
+    if PROVIDER_NAME == "openai":
+        return os.environ.get("OPENAI_MODEL", "gpt-4o")
+    return "noop"
+
+
+DEFAULT_MODEL = _default_model_label()
 
 # Cache directory for generated prompts. Each entry is keyed by
 # (slug, n, model). Re-runs reuse the cached variants unless
@@ -211,12 +229,10 @@ def generate_prompts(
         )
         return cached
 
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return []
-    try:
-        import requests  # type: ignore
-    except ImportError:
+    from utils.ai_parser import send_json
+    from utils.ai_provider import PROVIDER_NAME
+
+    if PROVIDER_NAME == "noop":
         return []
 
     app_name = _slug_to_app_name(slug)
@@ -238,35 +254,21 @@ def generate_prompts(
         "an array of N objects, each with: prompt, trigger_app, action_apps, reasoning."
     )
 
-    payload = {
-        "model": model or DEFAULT_MODEL,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": _build_system_prompt()},
-            {"role": "user",   "content": user_msg},
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-    }
-    try:
-        resp = requests.post(API_BASE, json=payload, headers=headers,
-                             timeout=REQUEST_TIMEOUT_S * 2)  # batch -> 60s
-    except Exception as e:
-        logger.error("[AI-prompt] batch request failed: %s", e)
+    outer, resp = send_json(
+        user_msg,
+        module=MODULE,
+        model=model,
+        system_prompt=_build_system_prompt(),
+        # N variants in one response — scales with n, unlike a single verdict.
+        max_tokens=4096,
+    )
+    if resp is not None and resp.error:
+        logger.error("[AI-prompt] batch request failed: %s", resp.error)
         return []
-    if resp.status_code != 200:
-        logger.error("[AI-prompt] batch HTTP %d: %s",
-                     resp.status_code, resp.text[:300])
+    if not isinstance(outer, dict):
+        logger.error("[AI-prompt] batch returned unparseable JSON.")
         return []
-    try:
-        content = resp.json()["choices"][0]["message"]["content"]
-        outer   = json.loads(content)
-        items   = outer.get("prompts") or outer.get("items") or []
-    except (KeyError, ValueError, json.JSONDecodeError) as e:
-        logger.error("[AI-prompt] batch parse error: %s", e)
-        return []
+    items = outer.get("prompts") or outer.get("items") or []
 
     results: list[GeneratedPrompt] = []
     dropped: list[tuple[GeneratedPrompt, str]] = []
@@ -315,51 +317,28 @@ def generate_prompt(slug: str, model: str | None = None) -> GeneratedPrompt | No
     if cached:
         return cached[0]
 
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
+    from utils.ai_parser import send_json
+    from utils.ai_provider import PROVIDER_NAME
+
+    if PROVIDER_NAME == "noop":
         logger.info(
-            "[AI-prompt] OPENAI_API_KEY not set — generator unavailable. "
+            "[AI-prompt] No AI provider configured — generator unavailable. "
             "Falling back to hardcoded flozic_prompts.json."
         )
         return None
 
-    try:
-        import requests  # type: ignore
-    except ImportError:
-        logger.error("[AI-prompt] 'requests' not installed.")
-        return None
-
     app_name = _slug_to_app_name(slug)
-    payload = {
-        "model": model or DEFAULT_MODEL,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": _build_system_prompt()},
-            {"role": "user",   "content": _build_user_prompt(app_name, slug)},
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-    }
-
-    try:
-        resp = requests.post(API_BASE, json=payload, headers=headers,
-                             timeout=REQUEST_TIMEOUT_S)
-    except Exception as e:
-        logger.error("[AI-prompt] OpenAI request failed: %s", e)
+    parsed, resp = send_json(
+        _build_user_prompt(app_name, slug),
+        module=MODULE,
+        model=model,
+        system_prompt=_build_system_prompt(),
+    )
+    if resp is not None and resp.error:
+        logger.error("[AI-prompt] request failed: %s", resp.error)
         return None
-
-    if resp.status_code != 200:
-        logger.error("[AI-prompt] OpenAI HTTP %d: %s",
-                     resp.status_code, resp.text[:300])
-        return None
-
-    try:
-        content = resp.json()["choices"][0]["message"]["content"]
-        parsed  = json.loads(content)
-    except (KeyError, ValueError, json.JSONDecodeError) as e:
-        logger.error("[AI-prompt] Could not parse OpenAI response: %s", e)
+    if not isinstance(parsed, dict):
+        logger.error("[AI-prompt] Could not parse response as JSON.")
         return None
 
     gen = GeneratedPrompt.from_dict(parsed)

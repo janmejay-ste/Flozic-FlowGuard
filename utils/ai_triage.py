@@ -1,5 +1,5 @@
 """
-GPT-based failure triage.
+AI-based failure triage.
 
 On test failure, we already capture:
   - screenshot.png   (visual state at failure)
@@ -7,7 +7,7 @@ On test failure, we already capture:
   - url.txt          (current URL)
   - the test exception + traceback
 
-This module bundles those artifacts into a single GPT call and asks the
+This module bundles those artifacts into a single vision call and asks the
 model to classify the failure and propose a fix. Output is written to
 the same failure folder as triage.json and surfaced by the dashboard.
 
@@ -18,9 +18,9 @@ Categories the model is asked to choose from:
   INFRA          — Playwright / browser / Python env issue
   TEST_BUG       — assertion or logic mistake in the test itself
 
-Environment:
-  OPENAI_API_KEY  — required. Without it, triage() returns SKIPPED.
-  OPENAI_MODEL    — optional. Default 'gpt-5.4' (per CLAUDE.md), overridable.
+Provider-agnostic — Claude or OpenAI, selected by env vars. See
+utils/ai_provider.py for the selection rules. With no provider configured,
+triage() returns SKIPPED and the test still fails loudly on its own terms.
 """
 
 from __future__ import annotations
@@ -28,19 +28,16 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
-API_BASE = "https://api.openai.com/v1/chat/completions"
-REQUEST_TIMEOUT_S = 60
+MODULE = "ai_triage"
 
-# Limit how much DOM we send — GPT cost scales with input tokens, and the
-# top of the body is usually enough to spot a missing element. 15KB is
-# about 4k tokens, which keeps a single triage call well under $0.05.
+# Limit how much DOM we send — cost scales with input tokens, and the top of
+# the body is usually enough to spot a missing element. 15KB is about 4k
+# tokens, which keeps a single triage call well under $0.05.
 DOM_EXCERPT_BYTES = 15_000
 
 
@@ -76,6 +73,8 @@ def _read_text_safe(p: Path, max_bytes: int | None = None) -> str:
 
 
 def _encode_image(p: Path) -> str | None:
+    """Deprecated: the provider abstraction encodes images per-provider now.
+    Retained for any external caller."""
     try:
         if not p.exists():
             return None
@@ -83,57 +82,6 @@ def _encode_image(p: Path) -> str | None:
     except Exception as e:
         logger.debug("Could not encode image %s: %s", p, e)
         return None
-
-
-def _build_prompt(
-    test_name: str, exception_message: str, traceback_text: str,
-    url: str, dom_excerpt: str,
-) -> str:
-    return (
-        "You are a senior QA engineer triaging an automated UI test failure.\n\n"
-        f"Test:       {test_name}\n"
-        f"URL:        {url or '(unknown)'}\n"
-        f"Exception:  {exception_message or '(none)'}\n\n"
-        "Traceback (last lines):\n"
-        f"{traceback_text or '(none)'}\n\n"
-        "DOM excerpt at failure (truncated):\n"
-        "----BEGIN DOM----\n"
-        f"{dom_excerpt or '(empty)'}\n"
-        "----END DOM----\n\n"
-        "A screenshot of the page at failure is attached.\n\n"
-        "Classify the root cause. Choose category from:\n"
-        "  PRODUCT_BUG    - the application is broken (real bug to file)\n"
-        "  LOCATOR_DRIFT  - the test selector no longer matches the DOM\n"
-        "  FLAKE          - transient (network/timing); would likely pass on rerun\n"
-        "  INFRA          - Playwright/browser/Python env issue\n"
-        "  TEST_BUG       - assertion or logic mistake in the test code itself\n\n"
-        "IMPORTANT classification guidance:\n"
-        "  - If the traceback references `ai_validator.py`, `ai_triage.py`, "
-        "or `ai_visual_diff.py` AND the exception is a JSON decode error, "
-        "TypeError on None, KeyError, or OpenAI HTTP error, the failure is "
-        "in the TEST FRAMEWORK's call to the OpenAI API — NOT the product. "
-        "Classify as INFRA with severity=minor. The application under test "
-        "is not at fault; an OpenAI response was empty/malformed.\n"
-        "  - If the exception message says 'AI rejected the canvas' or 'AI "
-        "rejected canvas', the canvas-validation step already determined "
-        "the application built the WRONG workflow. That is PRODUCT_BUG, "
-        "not TEST_BUG. Pick TEST_BUG only when the failure is in test "
-        "code itself (a typo'd selector, a wrong assertion, etc.).\n"
-        "  - If the exception is a wait-for-locator timeout AND the locator "
-        "targets a copilot/canvas element that should appear after backend "
-        "AI processing, prefer PRODUCT_BUG (backend stalled/produced wrong "
-        "output) over LOCATOR_DRIFT — unless the DOM clearly shows the "
-        "page advanced past where the locator was looking.\n"
-        "  - Reserve LOCATOR_DRIFT for cases where the DOM is fully loaded "
-        "and contains a similar-but-different element the test should have "
-        "matched instead.\n\n"
-        "Reply with a SINGLE JSON object, no other text, with keys:\n"
-        "  category (one of the five above),\n"
-        "  confidence (a float between 0.0 and 1.0 — your certainty),\n"
-        "  diagnosis (1-2 sentences describing what went wrong),\n"
-        "  suggested_fix (one-line action item),\n"
-        "  severity (minor | major | blocker)."
-    )
 
 
 def triage(
@@ -144,10 +92,14 @@ def triage(
     model: str | None = None,
 ) -> TriageResult:
     """
-    Read the failure artifacts in `failure_folder` and ask GPT to classify
-    the root cause. Writes the result to `failure_folder/triage.json` and
-    returns the TriageResult.
+    Read the failure artifacts in `failure_folder` and ask the model to
+    classify the root cause. Writes the result to `failure_folder/triage.json`
+    and returns the TriageResult.
     """
+    from utils import ai_prompts
+    from utils.ai_parser import send_json
+    from utils.ai_provider import PROVIDER_NAME
+
     def _persist(result: TriageResult) -> TriageResult:
         try:
             failure_folder.mkdir(parents=True, exist_ok=True)
@@ -158,20 +110,10 @@ def triage(
             logger.warning("Could not persist triage.json: %s", e)
         return result
 
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
+    if PROVIDER_NAME == "noop":
         return _persist(TriageResult(
             status="SKIPPED",
-            diagnosis="OPENAI_API_KEY not set; failure triage skipped.",
-        ))
-
-    try:
-        import requests  # type: ignore
-    except ImportError:
-        return _persist(TriageResult(
-            status="ERROR",
-            error="ModuleNotFoundError: requests",
-            diagnosis="'requests' package not installed.",
+            diagnosis="No AI provider configured; failure triage skipped.",
         ))
 
     # Gather artifacts.
@@ -180,48 +122,32 @@ def triage(
     url_path        = failure_folder / "url.txt"
     url             = _read_text_safe(url_path).strip()
     dom_excerpt     = _read_text_safe(dom_path, max_bytes=DOM_EXCERPT_BYTES)
-    image_data_url  = _encode_image(screenshot_path)
 
-    content: list = [
-        {"type": "text",
-         "text": _build_prompt(test_name, exception_message, traceback_text,
-                               url, dom_excerpt)}
-    ]
-    if image_data_url:
-        content.append({"type": "image_url", "image_url": {"url": image_data_url}})
+    prompt = ai_prompts.render(
+        "failure_triage",
+        test_name=test_name,
+        url=url or "(unknown)",
+        exception_message=exception_message or "(none)",
+        traceback_text=traceback_text or "(none)",
+        dom_excerpt=dom_excerpt or "(empty)",
+    )
 
-    payload = {
-        "model": model or DEFAULT_MODEL,
-        "response_format": {"type": "json_object"},
-        "messages": [{"role": "user", "content": content}],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-    }
+    parsed, resp = send_json(
+        prompt,
+        module=MODULE,
+        model=model,
+        image_paths=[screenshot_path] if screenshot_path.exists() else None,
+    )
 
-    try:
-        resp = requests.post(API_BASE, json=payload, headers=headers,
-                             timeout=REQUEST_TIMEOUT_S)
-    except Exception as e:
+    if resp is not None and resp.error:
         return _persist(TriageResult(
-            status="ERROR", error=str(e),
-            diagnosis=f"OpenAI request failed: {e}",
+            status="ERROR", error=resp.error,
+            diagnosis=f"{resp.provider} request failed: {resp.error}",
         ))
-
-    if resp.status_code != 200:
+    if not isinstance(parsed, dict):
         return _persist(TriageResult(
-            status="ERROR",
-            error=f"HTTP {resp.status_code}: {resp.text[:300]}",
-            diagnosis=f"OpenAI HTTP {resp.status_code}.",
-        ))
-
-    try:
-        parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
-    except (KeyError, ValueError, json.JSONDecodeError) as e:
-        return _persist(TriageResult(
-            status="ERROR", error=str(e),
-            diagnosis=f"Could not parse model output: {e}",
+            status="ERROR", error="ResponseParseError",
+            diagnosis="Could not parse model output as JSON.",
         ))
 
     # Coerce confidence to float in [0,1]. Tolerate the model returning a
@@ -252,7 +178,11 @@ def triage(
             "screenshot": str(screenshot_path) if screenshot_path.exists() else None,
             # DOM is large — link, don't embed.
             "dom_path":   str(dom_path) if dom_path.exists() else None,
-            "model":      model or DEFAULT_MODEL,
+            "provider":   resp.provider,
+            "model":      resp.model,
+            # Which prompt produced this verdict — lets a dashboard shift be
+            # traced to a prompt edit instead of blamed on the product.
+            "prompt_version": ai_prompts.version_for("failure_triage"),
         },
         raw=parsed,
     )
