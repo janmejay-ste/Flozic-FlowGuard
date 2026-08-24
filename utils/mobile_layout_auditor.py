@@ -87,17 +87,36 @@ class MobileLayoutAuditor:
     def check_fixed_width_offenders(self):
         """Finds specific elements wider than the viewport (root cause of overflow)."""
         vw = self.page.evaluate("window.innerWidth")
+        # An element wider than the viewport is only a defect if the USER pays
+        # for it: either the document scrolls sideways, or the element has no
+        # horizontally-scrollable ancestor to live in. A wide table inside an
+        # overflow-x container is the RECOMMENDED pattern — the marketing
+        # repo's own smoke test (group 3b) asserts exactly that for the
+        # Legal-Entity table. Reporting it as major produced 26 false majors
+        # (cmp-table + its thead/tr/tbody x 6 devices) in the 2026-08-20 full
+        # run and dragged the Mobile score to 40 on a page whose document
+        # never scrolled horizontally.
         offenders = self.page.evaluate(
             """
             (vw) => {
+              const docOverflow = document.documentElement.scrollWidth
+                                  - document.documentElement.clientWidth;
               const els = Array.from(document.querySelectorAll('body *'));
               const out = [];
               for (const el of els) {
                 const r = el.getBoundingClientRect();
-                if (r.width > vw + 5 && r.height > 0) {
-                  out.push({tag: el.tagName, cls: (el.className || '').toString().slice(0, 60), w: Math.round(r.width)});
-                  if (out.length >= 5) break;
+                if (!(r.width > vw + 5 && r.height > 0)) continue;
+                let contained = false;
+                for (let a = el.parentElement; a && a !== document.body; a = a.parentElement) {
+                  const cs = getComputedStyle(a);
+                  if (['auto', 'scroll', 'hidden'].includes(cs.overflowX)
+                      && a.clientWidth <= vw + 5) { contained = true; break; }
                 }
+                out.push({tag: el.tagName,
+                          cls: (el.className || '').toString().slice(0, 60),
+                          w: Math.round(r.width), contained,
+                          docOverflow: Math.round(docOverflow)});
+                if (out.length >= 8) break;
               }
               return out;
             }
@@ -105,12 +124,24 @@ class MobileLayoutAuditor:
             vw,
         )
         for o in offenders:
-            self._add(
-                "overflow", "major",
-                f"<{o['tag'].lower()}> (class=\"{o['cls']}\") renders {o['w']}px wide "
-                f"against a {vw}px viewport on {self.device_name}.",
-                selector=o["cls"] or o["tag"],
-            )
+            if o["contained"] and o["docOverflow"] <= 2:
+                self._add(
+                    "overflow", "info",
+                    f"<{o['tag'].lower()}> (class=\"{o['cls']}\") is {o['w']}px wide "
+                    f"but scrolls inside its own overflow-x container on "
+                    f"{self.device_name} — the recommended pattern, not a defect.",
+                    selector=o["cls"] or o["tag"],
+                )
+            else:
+                self._add(
+                    "overflow", "major",
+                    f"<{o['tag'].lower()}> (class=\"{o['cls']}\") renders {o['w']}px wide "
+                    f"against a {vw}px viewport on {self.device_name}"
+                    + (f" and the document scrolls {o['docOverflow']}px sideways"
+                       if o["docOverflow"] > 2 else " with no scrollable container")
+                    + ".",
+                    selector=o["cls"] or o["tag"],
+                )
 
     def check_tap_targets(self):
         elements = self.page.evaluate(
