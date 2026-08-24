@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "name": "FlowGuard — Gmail to Google Sheets",
+
+  "_comment": [
+    "Gmail 'New Email' -> Google Sheets 'Create Spreadsheet Row', with dynamic",
+    "field mapping. Confirmed against the product by Janmejay, 2026-08-11.",
+    "",
+    "__first__ means 'take whatever the product lists first'. Used where the",
+    "choice genuinely does not matter to the assertion (the Gmail account, the",
+    "mapping target column). The page object logs and records whichever value",
+    "it picked, so a failure stays reproducible.",
+    "",
+    "The mapping TARGET is __first__ because the Sheets row fields are labelled",
+    "with the spreadsheet's own COLUMN HEADERS — on 'Trail' those were things",
+    "like 'From pricing yearly', 'Professional', 'IND'. They are data, not UI",
+    "copy, so pinning one by name would break the moment the sheet is edited.",
+    "",
+    "source_field 'threadId' is a top-level scalar in the Gmail trigger's",
+    "sample payload, chosen because it is always present. Nested paths such as",
+    "payload.parts[1].filename exist in the sample too but the picker is a",
+    "flat list, so a nested key may not be selectable as one entry.",
+    "",
+    "ORDERING IS LOAD-BEARING, not stylistic:",
+    "  - trigger.run_test must be true. The editor resolves mapping tokens",
+    "    against the trigger's sample data, and that only exists after a run",
+    "    test. utils/connect_spec rejects a spec that maps without it.",
+    "  - Spreadsheet and Worksheet are dependent:true. The Sheets row fields",
+    "    (data1, data2, ...) load asynchronously only after both settle; the",
+    "    product allows itself 50s for that (see app-edit-options.component.ts",
+    "    onCopilotSetFieldMapping). Mapping before they load is the single",
+    "    biggest flake source in this flow."
+  ],
+
+  "trigger": {
+    "app": "Gmail",
+    "event": "New Email",
+    "account": "__first__",
+    "setup": [],
+    "run_test": true
+  },
+
+  "action": {
+    "app": "Google Sheets",
+    "event": "Create Spreadsheet Row",
+    "account": "janmejay@appypiellp.com",
+    "setup": [
+      { "field": "Spreadsheet", "value": "Test Sheet", "dependent": true },
+      { "field": "Worksheet",   "value": "Trail",      "dependent": true }
+    ],
+    "mapping": [
+      { "target": "__first__", "source_step": "Gmail", "source_field": "threadId" }
+    ]
+  },
+
+  "activate": true
+}

@@ -36,6 +36,7 @@ import pytest
 from playwright.sync_api import Page
 
 from pages.auth_helper import perform_login
+from pages.auth_state import is_on_auth_host
 from pages.dashboard_page import DashboardPage
 from pages.marketing.pricing_page import (
     PricingPage,
@@ -108,7 +109,8 @@ class TestPricingPlanTryNow:
             if not url:
                 return False
             return (
-                "authv2.flozic.ai" in url
+                # Any Cognito host — see pages/auth_state.AUTH_HOSTS
+                is_on_auth_host(url)
                 or "/portal-payment-handler" in url
                 or "loop.flozic.ai/connects" in url
                 or "loop.flozic.ai/plans" in url

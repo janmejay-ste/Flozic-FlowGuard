@@ -43,8 +43,12 @@ class TestLoginEntry:
         page.wait_for_load_state("domcontentloaded")
 
     def test_login_flow_starts_correctly(self) -> None:
-        # Mirror Java: a[title='log in']
-        self._page.locator("a[title='log in']").first.click()
+        # Was a raw a[title='log in'] click (mirroring Java). The 2026-08-20
+        # header restructure moved Log In into a mega-menu flyout, so the raw
+        # locator resolves to a hidden anchor and times out. The header
+        # component knows how to open the submenu first.
+        from pages.marketing.header_component import MarketingHeaderComponent
+        MarketingHeaderComponent(self._page).click_login()
         wait_for_auth_transition(self._page, timeout_ms=30_000)
         assert is_in_valid_state(self._page), (
             f"Login did not reach a valid auth state. URL={self._page.url}"

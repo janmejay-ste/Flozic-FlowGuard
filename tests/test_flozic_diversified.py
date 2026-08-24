@@ -32,6 +32,7 @@ from pages.connect_canvas import screenshot_canvas, wait_for_canvas_populated
 from pages.copilot_panel import CopilotPanel
 from pages.flozic_landing_page import FlozicLandingPage
 from pages.signup_to_login_switch import switch_signup_to_login_if_needed
+from pages.auth_state import is_on_auth_host
 from utils.ai_prompt_generator import generate_prompts
 from utils.ai_validator import validate_canvas_with_ai
 from utils.test_category import test_category
@@ -121,7 +122,8 @@ class TestFlozicDiversified:
 
         def _accept_either(url: str) -> bool:
             return (
-                "authv2.flozic.ai" in url
+                # Any Cognito host — see pages/auth_state.AUTH_HOSTS
+                is_on_auth_host(url)
                 or "connectcloud.appypie.com/connects" in url
                 or "connectcloud.appypie.com/customeditor" in url
             )

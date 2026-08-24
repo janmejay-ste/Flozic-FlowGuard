@@ -32,8 +32,19 @@ PRIMARY_LINKS: OrderedDict[str, str] = OrderedDict([
     ("Pricing",       "a[href*='/pricing'], a[href*='/pricing-plan'], a[title='Pricing']"),
     ("Blog",          "a[href='/blog/'], a[href$='/blog/']"),
     ("Sign Up",       "a[href*='/register'], a[href*='/signup'], a[title='Sign Up']"),
-    ("Login",         "a[href*='authv2.flozic.ai'], a[href*='accounts.appypie'], "
-                      "a[href*='/login'], a[title='log in'], a[title='Login'], "
+    # The live header's Login link points at loop.flozic.ai/auth/cognito/login
+    # (an app route that then redirects to the Cognito host), so the /login and
+    # text/title clauses are what actually match. The host clauses are kept for
+    # older marketing builds that linked straight to the IdP.
+    # /agent/login is EXCLUDED by name: on the live pricing page a BUY NOW
+    # CTA links to loop.flozic.ai/agent/login and the bare [href*='/login']
+    # clause clicked it (2026-08-20 run, "[header] Clicking 'Login' ->
+    # text='BUY NOW'"). The agent flow is out of scope for these tests.
+    ("Login",         "a[href*='auth/cognito/login'], "
+                      "a[href*='accounts.flozic.ai'], a[href*='authv2.flozic.ai'], "
+                      "a[href*='accounts.appypie'], "
+                      "a[href*='/login']:not([href*='/agent/']), "
+                      "a[title='log in'], a[title='Login'], "
                       "a:has-text('Login'), a:has-text('Log in'), a:has-text('Sign in')"),
 ])
 
@@ -59,23 +70,87 @@ class MarketingHeaderComponent:
 
     # ── Click actions (used by Functional tests) ──────────────────────
 
+    @staticmethod
+    def _safe_visible(el) -> bool:
+        try:
+            return el.is_visible()
+        except Exception:
+            return False
+
     def _click_first(self, name: str) -> None:
         """Click the first matching element for a primary-nav entry."""
         sel = PRIMARY_LINKS.get(name)
         if not sel:
             raise RuntimeError(f"Unknown primary nav link: {name}")
         loc = self.page.locator(sel)
-        total = loc.count()
+        # POLL, don't snapshot: the auth buttons (Log In / Sign Up) are a
+        # JS-injected island (fz-unified-auth-btns builder). A single pass at
+        # t=0 ran before injection finished — the 2026-08-20 failure artifacts
+        # contain the visible-by-then anchor that is_visible() had reported
+        # hidden moments earlier. Up to ~7s covers the injection window.
+        total = 0
+        for _attempt in range(14):
+            total = loc.count()
+            if any(self._safe_visible(loc.nth(i)) for i in range(total)):
+                break
+            self.page.wait_for_timeout(500)
         for i in range(total):
             el = loc.nth(i)
             try:
                 if el.is_visible():
                     el.scroll_into_view_if_needed()
+                    # Log the actual target before clicking. These selectors are
+                    # 9-clause OR lists, so "clicked Login" says very little —
+                    # a:has-text('Sign in') can match a promo or a cookie
+                    # banner. When the URL then fails to change, this line is
+                    # the difference between a diagnosable failure and a guess.
+                    try:
+                        logger.info(
+                            "[header] Clicking '%s' -> href=%r text=%r (match %d of %d)",
+                            name, el.get_attribute("href"),
+                            (el.inner_text() or "").strip()[:40], i + 1, total,
+                        )
+                    except Exception:
+                        pass
                     el.click(timeout=5_000)
                     return
             except Exception:
                 continue
-        raise RuntimeError(f"No visible '{name}' nav link found")
+        # SECOND PASS: the 2026-08-20 header restructure moved Log In into a
+        # mega-menu flyout (<ul class="sub-menu-link-list">), so no match is
+        # visible until a parent nav item opens. Hover each top-level item
+        # that owns a submenu and retry — this is exactly what a user does.
+        parents = self.page.locator(
+            "li.nav-item:has(ul[class*='sub-menu']) > a, "
+            "li.nav-item:has(ul[class*='sub-menu']) > span, "
+            "li.nav-item:has(ul[class*='sub-menu']) > button"
+        )
+        for pi in range(min(parents.count(), 8)):
+            par = parents.nth(pi)
+            try:
+                if not par.is_visible():
+                    continue
+                par.hover()
+                self.page.wait_for_timeout(400)
+            except Exception:
+                continue
+            for i in range(total):
+                el = loc.nth(i)
+                try:
+                    if el.is_visible():
+                        logger.info(
+                            "[header] Clicking '%s' inside the submenu opened by "
+                            "parent %d -> href=%r", name, pi + 1,
+                            el.get_attribute("href"),
+                        )
+                        el.click(timeout=5_000)
+                        return
+                except Exception:
+                    continue
+        raise RuntimeError(
+            f"No visible '{name}' nav link found, even after opening "
+            f"{min(parents.count(), 8)} submenu(s)."
+        )
 
     def click_pricing(self) -> None:        self._click_first("Pricing")
     def click_app_directory(self) -> None:  self._click_first("App Directory")

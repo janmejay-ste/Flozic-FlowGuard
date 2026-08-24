@@ -27,6 +27,7 @@ from playwright.sync_api import Page
 
 from pages.auth_helper import perform_login
 from pages.authv2_helper import handle_authv2_login_if_present
+from pages.auth_state import is_on_auth_host
 from pages.connect_canvas import screenshot_canvas, wait_for_canvas_populated
 from pages.copilot_panel import CopilotPanel
 from pages.flozic_landing_page import FlozicLandingPage
@@ -62,7 +63,6 @@ def run_flozic_app_connect_test(page: Page, app_key: str) -> None:
     slug = cfg["url_slug"]
     prompt = cfg["prompt"]
     expected_trigger = cfg["expected_trigger"]
-    kind = cfg.get("kind", "app")  # "app" (default) | "agent"
 
     # ── Optional: GPT-generated prompt instead of the hardcoded JSON ────────
     # Activate by setting FLOZIC_AI_PROMPT=true (+ OPENAI_API_KEY). When the
@@ -88,11 +88,8 @@ def run_flozic_app_connect_test(page: Page, app_key: str) -> None:
     landing = FlozicLandingPage(page)
     copilot = CopilotPanel(page)
 
-    # Step 1-3: open the page (app or conversational-agent), type prompt, click build.
-    if kind == "agent":
-        landing.open_conversational_agent(slug)
-    else:
-        landing.open_app(slug)
+    # Step 1-3: open the app page, type prompt, click build.
+    landing.open_app(slug)
     landing.submit_prompt(prompt)
 
     # Step 3.5: ISSUE handler — some apps (e.g. GoHighLevel) misroute the
@@ -116,7 +113,9 @@ def run_flozic_app_connect_test(page: Page, app_key: str) -> None:
         # Accept legacy connectcloud.appypie.com AND new loop.flozic.ai —
         # partial migration window, both hosts in use.
         return (
-            "authv2.flozic.ai" in url
+            # Any Cognito host — the Hosted UI was renamed once already
+            # (authv2.flozic.ai -> accounts.flozic.ai); see pages/auth_state.py
+            is_on_auth_host(url)
             or "connectcloud.appypie.com/connects" in url
             or "connectcloud.appypie.com/customeditor" in url
             or "loop.flozic.ai/connects" in url
@@ -136,23 +135,9 @@ def run_flozic_app_connect_test(page: Page, app_key: str) -> None:
     # the redirect didn't happen (normal path), True if credentials were resubmitted.
     handle_authv2_login_if_present(page)
 
-    # Step 5: wait for the final destination. Branch by flow kind:
-    #   - App flow:   /customeditor — workflow auto-builds, copilot reports back
-    #   - Agent flow: /agent/builder?agent=chat — conversational bot builder UI
-    #
-    # PRODUCT BUG: agent flows currently misroute to /connects (the workflow
-    # dashboard) instead of /agent/builder. wait_for_agent_builder() logs an
-    # [ISSUE] line when this happens and re-raises so the test fails loudly.
-    if kind == "agent":
-        landing.wait_for_agent_builder(timeout_ms=60_000)
-        # Agent flow has a different success contract than apps — no copilot
-        # panel + 'Connect created!' message. For now, reaching the builder
-        # URL IS the success gate. Skip the app-specific copilot assertions.
-        logger.info(
-            "=== SUCCESS: flozic agent builder reached for agent=%s ===", app_key,
-        )
-        return
-
+    # Step 5: wait for /customeditor — the workflow auto-builds there and the
+    # copilot reports back. (Conversational-agent flows were removed on
+    # 2026-08-11; they are covered by a separate automation suite.)
     landing.wait_for_customeditor(timeout_ms=120_000)
 
     # Step 6-7: copilot opens and reports 'Connect created!'.
