@@ -34,6 +34,23 @@ from utils.snapshot_writer import TestRecord
 from utils.error_clusterer import ErrorCluster
 
 
+# Scoring formula version. Bump whenever the weighting or the penalty model
+# changes, so a persisted score can be interpreted later.
+#   v1 = product 50 / infra 30 / framework 20
+#   v2 = adds Mobile. With mobile data: 40/25/20/15. WITHOUT mobile data the
+#        weights renormalise to exactly v1, so a run with no mobile tests
+#        scores identically under v1 and v2 -- the bump is not a silent
+#        rescoring of the existing suite.
+SCORING_VERSION = 2
+
+# Mobile penalties, mirroring the cluster model above.
+_MOBILE_PENALTY = {"blocker": 25, "major": 8, "minor": 3}
+_MOBILE_PENALTY_CAP = 60
+
+_W_WITH_MOBILE = {"product": 0.40, "infra": 0.25, "framework": 0.20, "mobile": 0.15}
+_W_NO_MOBILE = {"product": 0.50, "infra": 0.30, "framework": 0.20}
+
+
 @dataclass
 class LayeredScores:
     """
@@ -48,11 +65,25 @@ class LayeredScores:
     infra_health: int
     framework_health: int
     overall: int
+    # Failures excluded from product scoring because the harness could not run
+    # the check. Non-zero means product_health is based on fewer tests than ran
+    # — surface it rather than letting a clean-looking score imply coverage.
+    harness_fault_count: int = 0
+    # None means NO mobile tests ran. Deliberately not 100: claiming perfect
+    # mobile health for a run that never opened a mobile viewport is the same
+    # false-signal class as scoring an unset env var against the product.
+    mobile_health: int | None = None
+    mobile_major: int = 0
+    mobile_minor: int = 0
+    mobile_blocker: int = 0
+    scoring_version: int = SCORING_VERSION
 
 
 def compute(
     records: Sequence[TestRecord],
     clusters: Sequence[ErrorCluster],
+    mobile_findings: Sequence[dict] | None = None,
+    mobile_tested: bool | None = None,
 ) -> LayeredScores:
     """
     Compute domain-split health scores from test records + JS error clusters.
@@ -66,16 +97,35 @@ def compute(
 
     # ── Product Health ────────────────────────────────────────────────────────
     product_clusters = [c for c in clusters if c.domain == "PRODUCT"]
-    # "product failures" = any test that failed (excluding framework-tagged ones)
+    # "product failures" = any test that failed, EXCLUDING two kinds that say
+    # nothing about the application:
+    #   - framework/automation-tagged features (pre-existing rule)
+    #   - harness faults, where the harness could not run the check at all
+    #     (unset credentials, missing config — see utils/harness_errors)
+    #
+    # Attributing a harness fault to the product turns one unset env var into
+    # "Product: 0", i.e. a report that the application is critically broken
+    # when it was never exercised. Someone acts on that.
+    harness_faults = [
+        r for r in records
+        if r.status == "FAIL" and getattr(r, "harness_fault", False)
+    ]
     product_fails = [
         r for r in records
-        if r.status == "FAIL" and r.feature.upper() not in ("FRAMEWORK", "AUTOMATION")
+        if r.status == "FAIL"
+        and r.feature.upper() not in ("FRAMEWORK", "AUTOMATION")
+        and not getattr(r, "harness_fault", False)
     ]
 
-    if total == 0:
+    # Harness faults leave the denominator too: scoring 0/1 as "100% product
+    # pass" would be the opposite lie. A run that checked nothing has no
+    # product signal, so it reports the neutral 100 and relies on
+    # harness_fault_count to say why.
+    scored_total = total - len(harness_faults)
+    if scored_total <= 0:
         product_base = 100
     else:
-        product_base = round((total - len(product_fails)) / total * 100)
+        product_base = round((scored_total - len(product_fails)) / scored_total * 100)
 
     prod_crit    = sum(1 for c in product_clusters if c.severity == "CRITICAL")
     prod_high    = sum(1 for c in product_clusters if c.severity == "HIGH")
@@ -96,18 +146,62 @@ def compute(
     fw_penalty    = min(fw_crit * 6 + fw_high * 3, 30)
     framework_health = max(0, 100 - fw_penalty)
 
+    # ── Mobile Health ─────────────────────────────────────────────────────────
+    # `mobile_findings` is the session accumulator from mobile_report_builder.
+    # None or empty => no mobile tests ran => mobile is EXCLUDED from `overall`
+    # rather than scored 100.
+    mf = list(mobile_findings or [])
+    # `mobile_tested` distinguishes "ran, found nothing" (score 100) from
+    # "never ran" (None). Falling back to `bool(mf)` keeps older callers
+    # working, but a clean mobile run then reads as not-measured -- which is
+    # why the fixture reports the device list explicitly.
+    tested = bool(mf) if mobile_tested is None else bool(mobile_tested)
+    mobile_health: int | None = None
+    m_blocker = m_major = m_minor = 0
+    if tested:
+        for f in mf:
+            sev = (f.get("severity") or "").lower()
+            if sev == "blocker":
+                m_blocker += 1
+            elif sev == "major":
+                m_major += 1
+            elif sev == "minor":
+                m_minor += 1
+        penalty = min(
+            m_blocker * _MOBILE_PENALTY["blocker"]
+            + m_major * _MOBILE_PENALTY["major"]
+            + m_minor * _MOBILE_PENALTY["minor"],
+            _MOBILE_PENALTY_CAP,
+        )
+        mobile_health = max(0, 100 - penalty)
+
     # ── Overall (weighted) ────────────────────────────────────────────────────
-    overall = round(
-        product_health   * 0.50 +
-        infra_health     * 0.30 +
-        framework_health * 0.20
-    )
+    if mobile_health is None:
+        w = _W_NO_MOBILE
+        overall = round(
+            product_health * w["product"]
+            + infra_health * w["infra"]
+            + framework_health * w["framework"]
+        )
+    else:
+        w = _W_WITH_MOBILE
+        overall = round(
+            product_health * w["product"]
+            + infra_health * w["infra"]
+            + framework_health * w["framework"]
+            + mobile_health * w["mobile"]
+        )
 
     return LayeredScores(
         product_health=product_health,
         infra_health=infra_health,
         framework_health=framework_health,
         overall=overall,
+        harness_fault_count=len(harness_faults),
+        mobile_health=mobile_health,
+        mobile_major=m_major,
+        mobile_minor=m_minor,
+        mobile_blocker=m_blocker,
     )
 
 
