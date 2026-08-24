@@ -17,12 +17,18 @@ tests keep running.
 
 Both providers return the same `AIResponse` shape so callers write one
 JSON-parsing path. Vision support (image_paths) works for both.
+
+Every call routed through `send()` is metered by `utils/ai_cost_tracker.py`
+— token counts and USD are attributed to the calling ai_*.py module, and a
+session cap (FLOZIC_AI_COST_CAP_USD) short-circuits further calls once the
+budget is gone. Metering lives here rather than in each caller precisely
+because this is the one function they all already go through.
 """
 
 from __future__ import annotations
 
 import base64
-import json
+import inspect
 import logging
 import os
 from dataclasses import dataclass, field
@@ -76,6 +82,37 @@ def _pick_provider_name() -> str:
 PROVIDER_NAME = _pick_provider_name()
 
 
+# ── Caller attribution ─────────────────────────────────────────────────
+
+# Frames belonging to the plumbing itself — never the answer to "who spent
+# this?". Walking past them lands on the ai_*.py module that actually asked.
+_PLUMBING = {"ai_provider", "ai_parser", "claude_client", "ai_cost_tracker"}
+
+
+def _calling_module() -> str:
+    """
+    Best-effort name of the ai_*.py module that initiated this call.
+
+    Inferred from the stack rather than required as an argument so that cost
+    attribution works for every existing call site without touching it, and
+    can't silently go stale when a module is renamed. Callers that want to
+    be explicit can pass `module=`.
+    """
+    try:
+        for frame_info in inspect.stack()[1:]:
+            name = Path(frame_info.filename).stem
+            if name not in _PLUMBING and name.startswith("ai_"):
+                return name
+        # Not called from an ai_* module — a script or test calling directly.
+        for frame_info in inspect.stack()[1:]:
+            name = Path(frame_info.filename).stem
+            if name not in _PLUMBING:
+                return name
+    except Exception:            # pragma: no cover — introspection is best-effort
+        pass
+    return "unknown"
+
+
 # ── Uniform send() ─────────────────────────────────────────────────────
 
 
@@ -88,6 +125,7 @@ def send(
     temperature:    float = 0.0,
     max_tokens:     int   = 2048,
     system_prompt:  str   | None = None,
+    module:         str   | None = None,
 ) -> AIResponse:
     """
     Send a prompt to the selected provider. Returns AIResponse.
@@ -95,20 +133,52 @@ def send(
     Callers should not need to know which provider is in use. When adding
     a new ai_*.py module, use `send()` — never import provider modules
     directly. This keeps future model migrations to one place.
+
+    `module` names the spender for cost attribution; when omitted it is
+    inferred from the call stack.
     """
+    from utils import ai_cost_tracker
+
+    attribution = module or _calling_module()
+
+    # Budget gate. Refusing here — rather than inside each caller — means a
+    # blown budget degrades every AI feature the same way: to the SKIPPED /
+    # keyword-only path the modules already handle. Tests keep running.
+    if ai_cost_tracker.over_budget():
+        return AIResponse(
+            provider=PROVIDER_NAME,
+            error=(
+                f"AI session budget of ${ai_cost_tracker.TRACKER.cap_usd:.2f} "
+                f"exhausted; call from {attribution} skipped."
+            ),
+        )
+
     if PROVIDER_NAME == "claude":
-        return _send_claude(
+        resp = _send_claude(
             prompt, model=model, image_paths=image_paths,
             response_json=response_json, temperature=temperature,
             max_tokens=max_tokens, system_prompt=system_prompt,
         )
-    if PROVIDER_NAME == "openai":
-        return _send_openai(
+    elif PROVIDER_NAME == "openai":
+        resp = _send_openai(
             prompt, model=model, image_paths=image_paths,
             response_json=response_json, temperature=temperature,
             max_tokens=max_tokens, system_prompt=system_prompt,
         )
-    return AIResponse(provider="noop", error="No AI provider configured.")
+    else:
+        return AIResponse(provider="noop", error="No AI provider configured.")
+
+    # Record even on error: a failed call that burned input tokens still
+    # costs money, and an error rate per module is worth seeing.
+    ai_cost_tracker.record(
+        module=attribution,
+        provider=resp.provider,
+        model=resp.model,
+        input_tokens=resp.input_tokens,
+        output_tokens=resp.output_tokens,
+        error=resp.error,
+    )
+    return resp
 
 
 # ── Claude adapter ─────────────────────────────────────────────────────
@@ -212,13 +282,28 @@ def _send_openai(
         )
 
     usage = data.get("usage") or {}
+    finish_reason = str(data["choices"][0].get("finish_reason") or "")
     parsed = None
+    truncated: str | None = None
     if response_json:
-        try:
-            parsed = json.loads(text)
-        except (ValueError, TypeError) as e:
-            logger.warning("[openai] non-JSON response: %s (first 120 chars: %r)",
-                           e, text[:120])
+        from utils.ai_parser import parse_json
+        result = parse_json(text)
+        parsed = result if isinstance(result, dict) else None
+        if parsed is None and text:
+            if finish_reason == "length":
+                # The completion hit max_tokens mid-JSON. Reported as an
+                # error (not just a warning) because send_json's corrective
+                # retry re-sends with the SAME cap and a LONGER prompt — it
+                # is guaranteed to truncate again, so it must not run.
+                truncated = (
+                    f"response truncated at max_tokens={max_tokens} "
+                    "(finish_reason=length) — the output budget is too "
+                    "small for this prompt; raise max_tokens at the call site"
+                )
+                logger.warning("[openai] %s", truncated)
+            else:
+                logger.warning("[openai] non-JSON response (first 120 chars: %r)",
+                               text[:120])
     return AIResponse(
         text          = text,
         parsed_json   = parsed,
@@ -226,4 +311,5 @@ def _send_openai(
         model         = model,
         input_tokens  = int(usage.get("prompt_tokens", 0) or 0),
         output_tokens = int(usage.get("completion_tokens", 0) or 0),
+        error         = truncated,
     )
