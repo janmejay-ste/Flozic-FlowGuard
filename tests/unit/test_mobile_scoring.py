@@ -758,7 +758,6 @@ def test_quality_empty_is_100():
 
 
 import json, types
-from utils.error_clusterer import ErrorCluster  # noqa: E402
 
 def _cov(att, exe, na):
     return {"attempted": att, "executed": exe, "na_structural": na}
@@ -785,8 +784,33 @@ def test_coverage_gate_returns_none():
     s = compute([], [], mobile_findings=fs, mobile_tested=True, check_stats=_cov(100, 20, 0))  # 0.2 < 0.33
     assert s.mobile_health is None                  # insufficient coverage
     assert s.mobile_quality is not None             # quality still computed
+    # renormalises to v1 weighting (50/30/20) exactly like tested=False does --
+    # the gate path must not silently keep a mobile term out of `overall`.
+    rec = types.SimpleNamespace(status="PASS", feature="Marketing", harness_fault=False)
+    s_over = compute([rec], [], mobile_findings=fs, mobile_tested=True, check_stats=_cov(100, 20, 0))
+    assert s_over.overall == 100
     s2 = compute([], [], mobile_findings=fs, mobile_tested=True, check_stats=_cov(100, 0, 100))  # executable 0
     assert s2.mobile_health is None
+
+def test_coverage_gate_boundary_is_exclusive():
+    """0.33 itself must NOT gate -- the gate is `< 0.33`, not `<= 0.33`."""
+    from utils.layered_health_scores import compute
+    fs = [_mk("minor","tap_target","iPhone SE","A")]
+    s = compute([], [], mobile_findings=fs, mobile_tested=True, check_stats=_cov(100, 33, 0))  # 0.33
+    assert s.mobile_coverage == 0.33
+    assert s.mobile_health == round(s.mobile_quality * 0.33)
+
+def test_check_stats_present_but_nothing_attempted_gates():
+    """A check_stats dict that IS present (instrumentation ran) but recorded
+    zero attempts is a real coverage failure, distinct from `check_stats=None`
+    (never instrumented). Both must not be conflated into "score on quality
+    alone" -- only the latter should."""
+    from utils.layered_health_scores import compute
+    fs = [_mk("minor","tap_target","iPhone SE","A")]
+    s = compute([], [], mobile_findings=fs, mobile_tested=True,
+                check_stats=_cov(0, 0, 0))
+    assert s.mobile_health is None
+    assert s.mobile_quality is not None
 
 def test_no_coverage_instrumentation_scores_on_quality():
     from utils.layered_health_scores import compute
@@ -811,6 +835,6 @@ def test_real_run_scores_match_spec():
         cs = d.get("check_stats")
         # older sidecars may still be 2-key; skip if na_structural absent
         if not cs or "na_structural" not in cs:
-            import pytest; pytest.skip(f"{path} predates 3-way tally")
+            pytest.skip(f"{path} predates 3-way tally")
         s = compute([], [], mobile_findings=d["findings"], mobile_tested=True, check_stats=cs)
         assert s.mobile_health == exp

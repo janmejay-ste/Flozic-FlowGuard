@@ -84,12 +84,12 @@ def _mobile_quality(findings):
 def _mobile_coverage(check_stats):
     """coverage = executed / executable, executable = attempted − na_structural.
     None => not instrumented (cannot discount what we did not measure).
-    0.0  => nothing was executable (engine could run nothing)."""
+    0.0  => a check_stats dict was present but nothing was executable (includes
+            attempted == 0, and all-structural attempted > 0 cases) — this
+            drives the coverage gate to fire, since 0.0 < _MOBILE_COVERAGE_GATE."""
     if not check_stats:
         return None
     att = int(check_stats.get("attempted", 0) or 0)
-    if att == 0:
-        return None
     executable = att - int(check_stats.get("na_structural", 0) or 0)
     if executable <= 0:
         return 0.0
