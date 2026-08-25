@@ -66,14 +66,22 @@ def mobile_was_exercised() -> bool:
     return bool(_SESSION_DEVICES) or bool(_SESSION_FINDINGS)
 
 
-def note_check_run(engine: str, executed: bool) -> None:
-    """Record one interaction-check attempt. executed=False means the check
-    could not actually be exercised on this engine (UNTESTED/UNSUPPORTED or
-    the check crashed) — attempted-but-not-executed is the coverage gap."""
-    e = _SESSION_CHECKS.setdefault(engine or "?", {"attempted": 0, "executed": 0})
+def note_check_run(engine: str, executed: bool, structural: bool = False) -> None:
+    """Record one interaction-check attempt.
+
+    executed=True  -> ran to a real conclusion (incl. content-driven N/A).
+    executed=False, structural=True  -> engine literally cannot run it
+        (UNTESTED/UNSUPPORTED). Excluded from the coverage denominator.
+    executed=False, structural=False -> attempted but crashed/flaked
+        ("NOT verified"). A real coverage gap that discounts the score.
+    """
+    e = _SESSION_CHECKS.setdefault(
+        engine or "?", {"attempted": 0, "executed": 0, "na_structural": 0})
     e["attempted"] += 1
     if executed:
         e["executed"] += 1
+    elif structural:
+        e["na_structural"] += 1
 
 
 def session_check_stats() -> dict[str, dict[str, int]]:

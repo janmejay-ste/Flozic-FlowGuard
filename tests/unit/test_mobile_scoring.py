@@ -621,8 +621,8 @@ def test_check_run_tally_and_reset():
     mrb.note_check_run("webkit", executed=False)
     mrb.note_check_run("chromium", executed=True)
     stats = mrb.session_check_stats()
-    assert stats["webkit"] == {"attempted": 2, "executed": 1}
-    assert stats["chromium"] == {"attempted": 1, "executed": 1}
+    assert stats["webkit"] == {"attempted": 2, "executed": 1, "na_structural": 0}
+    assert stats["chromium"] == {"attempted": 1, "executed": 1, "na_structural": 0}
     mrb.reset_session_findings()
     assert mrb.session_check_stats() == {}
 
@@ -637,7 +637,7 @@ def test_crash_is_not_executed_but_content_na_is():
     mrb.reset_session_findings()
     a = A(page=None, page_name="login", device_name="iPhone SE")
     a.run_all(include={"scroll", "form"})
-    assert mrb.session_check_stats()[a.engine] == {"attempted": 2, "executed": 1}
+    assert mrb.session_check_stats()[a.engine] == {"attempted": 2, "executed": 1, "na_structural": 0}
 
 
 def test_dashboard_stat_strip_and_coverage_lines(monkeypatch):
@@ -679,4 +679,15 @@ def test_direct_check_invocation_is_tallied():
     a = A(page=None, page_name="app_directory", device_name="Pixel 5")
     with _pytest.raises(AttributeError):
         a.check_vertical_scroll()          # direct call; crashes on page=None
-    assert mrb.session_check_stats()[a.engine] == {"attempted": 1, "executed": 0}
+    assert mrb.session_check_stats()[a.engine] == {"attempted": 1, "executed": 0, "na_structural": 0}
+
+
+def test_check_tally_records_structural_separately():
+    import utils.mobile_report_builder as mrb
+    mrb.reset_session_findings()
+    mrb.note_check_run("webkit", executed=True)                     # ran clean
+    mrb.note_check_run("webkit", executed=False, structural=True)   # engine can't (UNTESTED)
+    mrb.note_check_run("webkit", executed=False, structural=False)  # crashed (NOT verified)
+    assert mrb.session_check_stats()["webkit"] == {
+        "attempted": 3, "executed": 1, "na_structural": 1,
+    }

@@ -78,12 +78,16 @@ def _tallied(fn):
             ok = False
             raise
         finally:
-            executed = ok and not any(
-                "UNTESTED" in f.message or "UNSUPPORTED" in f.message
-                or "NOT verified" in f.message
-                for f in self.findings[before:]
-            )
-            note_check_run(self.engine, executed)
+            new = self.findings[before:]
+            untested = any("UNTESTED" in f.message or "UNSUPPORTED" in f.message
+                           for f in new)
+            crashed = any("NOT verified" in f.message for f in new)
+            if crashed or not ok:             # hard crash or added "NOT verified"
+                note_check_run(self.engine, executed=False, structural=False)
+            elif untested:                    # engine capability gap -> N/A
+                note_check_run(self.engine, executed=False, structural=True)
+            else:                             # check completed successfully
+                note_check_run(self.engine, executed=True)
     return wrapper
 
 logger = logging.getLogger(__name__)
