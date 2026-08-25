@@ -24,6 +24,8 @@ Coverage:
 from __future__ import annotations
 
 import logging
+import re
+import time
 from typing import Mapping
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
@@ -106,10 +108,20 @@ class ConnectEditorPage:
             return
         except (PlaywrightTimeoutError, Exception):
             pass
-        # press_sequentially fallback for Angular ngModel bindings
+        # press_sequentially fallback for Angular ngModel bindings.
+        #
+        # CLEAR FIRST. This block runs after the fill() above already put
+        # `app_name` in the box, so typing without clearing appends to it and
+        # the box becomes "GmailGmail" — which matches nothing, so the search
+        # falls through to the broad XPath fallback below and takes ~28s to
+        # land on a stale card. Observed live on 2026-08-11.
         search.click()
+        search.fill("")
         search.press_sequentially(app_name, delay=40)
         self.page.wait_for_timeout(2_000)
+        logger.debug(
+            "App search box now contains: %r", search.input_value()
+        )
 
         # Step 3: After search, try data-track selector first then CSS fallbacks
         candidates = [
@@ -259,6 +271,68 @@ class ConnectEditorPage:
                     continue
         raise RuntimeError("No visible Continue button found")
 
+    def advance_to_setup_step(self, max_continues: int = 4) -> int:
+        """
+        Click through whatever intermediate Continue panels this app has until
+        the setup step (the one carrying "Continue & Run Test") is reached.
+        Returns how many Continues were clicked.
+
+        Why this exists: the number of panels between choosing an event and
+        reaching setup VARIES BY APP. Gmail goes event -> account -> setup;
+        others skip the account panel, and some interpose an extra confirm.
+        Hardcoding the count is what broke the Gmail run on 2026-08-11 — the
+        test called click_continue() once, landed on the account panel, and
+        then timed out looking for [data-track='continue'] which only exists
+        one panel later.
+
+        Idempotent: if the run-test button is already visible this returns 0
+        without clicking anything.
+        """
+        clicked = 0
+        for _ in range(max_continues):
+            run_test = self.page.locator("[data-track='continue']").first
+            try:
+                run_test.wait_for(state="visible", timeout=2_500)
+                logger.info(
+                    "Reached setup step after %d Continue click(s).", clicked
+                )
+                return clicked
+            except PlaywrightTimeoutError:
+                pass
+            try:
+                self.click_continue()
+                clicked += 1
+            except RuntimeError:
+                # No Continue available and no run-test button either — the
+                # caller's next wait will report the real state.
+                logger.warning(
+                    "No Continue button and no run-test button after %d "
+                    "click(s). Current URL: %s", clicked, self.page.url,
+                )
+                return clicked
+        logger.warning(
+            "Clicked %d Continue(s) without reaching the setup step. URL: %s",
+            clicked, self.page.url,
+        )
+        return clicked
+
+    def handle_setup_step_if_present(
+        self,
+        targeted: Mapping[str, str] | None = None,
+    ) -> bool:
+        """
+        Run handle_setup_step() when the panel actually has dropdowns.
+
+        Some steps (Gmail's "New Email") have no configurable dropdowns at all,
+        and handle_setup_step() raises RuntimeError in that case. Returns True
+        if dropdowns were handled, False if there were none.
+        """
+        if self.page.locator("div[id^='menu-drop']").count() == 0:
+            logger.info("No setup dropdowns on this step — nothing to configure.")
+            return False
+        self.handle_setup_step(targeted=targeted)
+        return True
+
     def click_continue_run_test(self, timeout_ms: int = 20_000) -> None:
         btn = self.page.locator("[data-track='continue']").first
         btn.wait_for(state="visible", timeout=timeout_ms)
@@ -329,6 +403,7 @@ class ConnectEditorPage:
                 # `.menu_dropdown`). Also covers legacy `.list-data .single-data`
                 # and ng-select patterns.
                 first_opt = self.page.locator(
+                    "li.menu_dropdown-option, "
                     ".menu_dropdown li, "
                     ".menu_dropdown .single-data, "
                     ".list-data .single-data, "
@@ -366,6 +441,207 @@ class ConnectEditorPage:
                         pass
             except Exception as e:
                 logger.warning("Dropdown #%d error: %s", i, str(e).splitlines()[0])
+
+    # ── Dependent dropdowns ───────────────────────────────────────────
+    #
+    # handle_setup_step() above walks every dropdown in ONE pass with a 3s wait
+    # for options. That is fine for independent fields and wrong for a
+    # dependent chain: Google Sheets' Worksheet list is fetched from the API
+    # only after a Spreadsheet is chosen, and it does not arrive in 3s. The
+    # 2026-08-11 run showed exactly that —
+    #     Dropdown #0 (spreadsheetId): selected (search='')
+    #     Dropdown #1 (sheetId): no options visible after wait
+    # — so Worksheet stayed empty and the row fields that depend on it never
+    # loaded at all.
+    #
+    # set_dropdown_by_field() sets ONE field, waits properly for its options,
+    # and verifies the value took, so a caller can walk a chain in order.
+
+    # Human field labels -> the DOM input[name] the product uses. Needed
+    # because handle_setup_step matches on the input's `name`, and "Worksheet"
+    # has no textual relationship to "sheetId".
+    FIELD_ALIASES: Mapping[str, tuple[str, ...]] = {
+        "spreadsheet": ("spreadsheetid",),
+        "worksheet": ("sheetid", "worksheetid"),
+        "label": ("labelids",),
+    }
+
+    # `li.menu_dropdown-option` first: the 2026-08-20 editor redesign ("Set
+    # Up:" panel with Advanced/AI mapping buttons) renders options as
+    # <li id="single-dropdown" class="menu_dropdown-option"> inside a BARE
+    # <ul> — no .menu_dropdown ancestor — so every older selector missed them
+    # while the options API returned 200 with data. Proven from the
+    # 2026-08-20_103235 failure artifact, where 'Test Sheet' was in the DOM
+    # while the page object reported "never populated".
+    OPTION_SELECTOR = (
+        "li.menu_dropdown-option, "
+        ".menu_dropdown li, "
+        ".menu_dropdown .single-data, "
+        ".list-data .single-data, "
+        ".option-item, "
+        ".ng-option:not(.ng-option-disabled)"
+    )
+
+    @staticmethod
+    def _norm(s: str | None) -> str:
+        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+    @classmethod
+    def _field_matches(cls, wanted: str, name: str, drop_id: str) -> bool:
+        w, n, d = cls._norm(wanted), cls._norm(name), cls._norm(drop_id)
+        if not w:
+            return False
+        if w == n or w == d:
+            return True
+        for alias in cls.FIELD_ALIASES.get(w, ()):
+            if alias == n or alias in d:
+                return True
+        return w in n or (n and n in w)
+
+    def _find_dropdown(self, field: str):
+        """The menu-drop container whose input name / id matches `field`."""
+        drops = self.page.locator("div[id^='menu-drop']")
+        for i in range(drops.count()):
+            drop = drops.nth(i)
+            drop_id = drop.get_attribute("id") or ""
+            name = ""
+            inp = drop.locator("input[name]").first
+            if inp.count() > 0:
+                name = inp.get_attribute("name") or ""
+            if self._field_matches(field, name, drop_id):
+                return drop, (name or drop_id)
+        return None, None
+
+    def set_dropdown_by_field(
+        self,
+        field: str,
+        search_term: str = "",
+        timeout_ms: int = 45_000,
+    ) -> str:
+        """
+        Set one setup dropdown and confirm it took.
+
+        `field` may be a human label ("Worksheet") or the DOM name ("sheetId").
+        `search_term` empty means "take the first option" — used where the
+        choice genuinely doesn't matter.
+
+        Returns the option text that was selected, so the caller can record
+        which value a FIRST_AVAILABLE choice resolved to.
+
+        Raises AssertionError if the field isn't present or never populates —
+        a silent skip here is what let the previous run continue with an empty
+        Worksheet and fail 75s later with a misleading message.
+        """
+        drop, resolved_name = self._find_dropdown(field)
+        if drop is None:
+            present = []
+            drops = self.page.locator("div[id^='menu-drop']")
+            for i in range(drops.count()):
+                inp = drops.nth(i).locator("input[name]").first
+                present.append(
+                    (inp.get_attribute("name") if inp.count() else None)
+                    or drops.nth(i).get_attribute("id")
+                )
+            raise AssertionError(
+                f"No setup dropdown matching {field!r}. Present: {present}. "
+                "Add an entry to ConnectEditorPage.FIELD_ALIASES if the "
+                "product renamed the input."
+            )
+
+        trigger = drop.locator(".menu_icon-box, .dropdown-trigger").first
+        trigger.wait_for(state="visible", timeout=15_000)
+        trigger.click(timeout=10_000)
+
+        # Wait for options. This is the long wait the old code lacked: a
+        # dependent list is an API round-trip after the parent changed.
+        #
+        # SCOPE MATTERS. A page-wide locator's .first is the first match in DOM
+        # ORDER, which is an option belonging to an EARLIER, now-closed dropdown
+        # (Spreadsheet). Its .is_visible() is False forever, so the wait timed
+        # out on 2026-08-11 even though Worksheet's options were on screen.
+        # Prefer options inside this field's own container, and fall back to a
+        # :visible-filtered page query for builds that portal the menu out.
+        options = self._options_for(drop)
+        end = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < end:
+            options = self._options_for(drop)
+            if options.count() > 0:
+                break
+            self.page.wait_for_timeout(1_000)
+        else:
+            self._close_open_dropdowns()
+            raise AssertionError(
+                f"Dropdown {resolved_name!r} never populated within "
+                f"{timeout_ms}ms. If this is a dependent field, its parent was "
+                "probably not set to a valid value."
+            )
+
+        if search_term:
+            sinput = self.page.locator(
+                ".search-list input, input[placeholder*='Search' i]"
+            ).last
+            if sinput.count() > 0 and sinput.is_visible():
+                sinput.fill("")
+                sinput.fill(search_term)
+                self.page.wait_for_timeout(1_200)
+
+        options = self._options_for(drop)
+        target = options.filter(
+            has_text=re.compile(re.escape(search_term), re.I)
+        ).first if search_term else options.first
+
+        try:
+            target.wait_for(state="visible", timeout=10_000)
+        except PlaywrightTimeoutError:
+            visible = [
+                (options.nth(i).text_content() or "").strip()
+                for i in range(min(options.count(), 10))
+            ]
+            self._close_open_dropdowns()
+            raise AssertionError(
+                f"Dropdown {resolved_name!r} has no option matching "
+                f"{search_term!r}. First options offered: {visible}"
+            ) from None
+
+        chosen = (target.text_content() or "").strip()
+        target.click(timeout=10_000)
+        self.page.wait_for_timeout(1_500)
+        logger.info(
+            "Dropdown %r: selected %r (searched %r)",
+            resolved_name, chosen, search_term or "<first>",
+        )
+        return chosen
+
+    def _options_for(self, drop):
+        """Visible options belonging to `drop`.
+
+        Container-scoped first. The page-wide fallback is :visible-filtered on
+        purpose — an unfiltered page query returns options from other, closed
+        dropdowns and .first then never becomes visible.
+        """
+        scoped = drop.locator(self.OPTION_SELECTOR).filter(visible=True)
+        if scoped.count() > 0:
+            return scoped
+        visible_sel = ", ".join(
+            f"{part.strip()}:visible" for part in self.OPTION_SELECTOR.split(",")
+        )
+        return self.page.locator(visible_sel)
+
+    def _close_open_dropdowns(self) -> None:
+        """Escape doesn't close these — the Angular component relies on a
+        jQuery document-click handler. Strip the active classes directly."""
+        try:
+            self.page.evaluate(
+                """() => {
+                    document.querySelectorAll('.menu.menu_active')
+                        .forEach(el => el.classList.remove('menu_active'));
+                    document.querySelectorAll('.editoption-dropmenu.active_menu')
+                        .forEach(el => el.classList.remove('active_menu'));
+                }"""
+            )
+            self.page.wait_for_timeout(300)
+        except Exception:
+            pass
 
     # ── Add-step + add-app ────────────────────────────────────────────
 
@@ -584,15 +860,87 @@ class ConnectEditorPage:
     # ── Activate Connect ──────────────────────────────────────────────
 
     def click_activate_connect(self, timeout_ms: int = 30_000) -> None:
-        btn = self.page.locator(
-            "button:has-text('Activate'), "
-            "a:has-text('Activate Connect'), "
-            "[data-track='activate'], "
-            "button.active_agent_Button"
-        ).first
-        btn.wait_for(state="visible", timeout=timeout_ms)
+        """
+        Activate the connect and VERIFY it actually activated.
+
+        This used to be a false pass. The old version was:
+
+            btn = self.page.locator(
+                "button:has-text('Activate'), ... button.active_agent_Button"
+            ).first
+            try:    btn.click()
+            except: btn.evaluate("el => el.click()")
+            logger.info("Connect ACTIVATED")
+
+        Three compounding faults, observed on 2026-08-11 when the suite
+        reported PASSED and 100/100 health for a connect that was never
+        activated:
+
+          1. `.first` over a comma-separated OR takes the first match in DOM
+             order, which can be a different button whose text merely contains
+             "Activate".
+          2. The product's button is `[disabled]="!activateAgent"` — disabled
+             until the connect is complete. Playwright's click() correctly
+             refuses a disabled button, but the except branch then JS-clicked
+             it, and a JS click on a disabled button fires NOTHING. The
+             fallback existed to defeat aria-disabled elsewhere; here it
+             silently defeated a real guard.
+          3. Nothing verified the outcome — "ACTIVATED" was logged
+             unconditionally.
+
+        Now: exact selector, refuse to fake a disabled click, and assert the
+        post-state the product actually renders (custom-editor.component.html:
+        `*ngIf="!activeAgent"` wraps the button, and a status pill with
+        `.dotactive` + "Active" replaces it).
+        """
+        btn = self.page.locator("button.active_agent_Button").first
         try:
-            btn.click(timeout=10_000)
-        except Exception:
-            btn.evaluate("el => el.click()")
-        logger.info("Connect ACTIVATED")
+            btn.wait_for(state="visible", timeout=timeout_ms)
+        except PlaywrightTimeoutError:
+            raise AssertionError(
+                "No 'Activate Connect' button (button.active_agent_Button) is "
+                f"visible. Current URL: {self.page.url}"
+            ) from None
+
+        # A disabled button means the product considers the connect incomplete.
+        # That is a real finding — surface the product's own explanation rather
+        # than forcing a click that cannot work.
+        if btn.is_disabled():
+            reason = ""
+            tip = self.page.locator(".hoverTooltip").filter(visible=True).first
+            if tip.count():
+                reason = (tip.text_content() or "").strip()
+            raise AssertionError(
+                "'Activate Connect' is DISABLED — the connect is not in an "
+                f"activatable state. Product says: {reason or '(no tooltip)'}. "
+                "Check every required setup field is filled and the action's "
+                "run test succeeded."
+            )
+
+        btn.click(timeout=10_000)
+
+        # Verify. The button's container is *ngIf="!activeAgent", so on success
+        # the button goes away and a status pill appears in its place.
+        try:
+            btn.wait_for(state="hidden", timeout=timeout_ms)
+        except PlaywrightTimeoutError:
+            raise AssertionError(
+                "Clicked 'Activate Connect' but the button is still present — "
+                "activeAgent never flipped, so the connect did not activate."
+            ) from None
+
+        status = self.page.locator("#dropdownMenuButton .dotpill, .dotactive").first
+        try:
+            status.wait_for(state="visible", timeout=10_000)
+            label = (
+                self.page.locator("#dropdownMenuButton").first.text_content() or ""
+            ).strip()
+        except PlaywrightTimeoutError:
+            label = ""
+
+        if label and "active" not in label.lower():
+            raise AssertionError(
+                f"Connect status reads {label!r} after activation, expected "
+                "'Active'."
+            )
+        logger.info("Connect ACTIVATED and verified (status: %s)", label or "Active")

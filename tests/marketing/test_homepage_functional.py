@@ -13,6 +13,7 @@ import pytest
 from playwright.sync_api import Page
 
 from pages.marketing.home_page import HomePage
+from pages.auth_state import AUTH_HOSTS, is_on_auth_host
 from utils.test_category import test_category
 
 logger = logging.getLogger(__name__)
@@ -61,10 +62,20 @@ class TestHomepageFunctional:
 
     def test_header_login_routes_to_auth_domain(self) -> None:
         self._home.header().click_login()
-        _wait_for_url_contains(self._page, "authv2.flozic.ai", "accounts.appypie", "/login")
+        # AUTH_HOSTS is the framework's single source of truth for "is this an
+        # auth host?" -- the same tuple auth_state/authv2_helper use. Naming
+        # hosts here is what left this test asserting on authv2.flozic.ai for
+        # weeks after the product moved to accounts.flozic.ai, passing only on
+        # the incidental "/login" clause.
+        _wait_for_url_contains(self._page, *AUTH_HOSTS, "/login")
         url = self._page.url
-        assert "authv2.flozic.ai" in url or "accounts.appypie" in url or "/login" in url, (
-            f"Header login did not route to auth domain. Final: {url}"
+        assert is_on_auth_host(url) or "/login" in url, (
+            f"Header login did not route to an auth domain.\n"
+            f"  Final URL   : {url}\n"
+            f"  Known hosts : {', '.join(AUTH_HOSTS)}\n"
+            f"  If the URL above is the marketing page, the click never "
+            f"navigated -- check the '[header] Clicking ...' log line for what "
+            f"was actually clicked."
         )
 
     def test_header_pricing_routes_to_pricing_page(self) -> None:

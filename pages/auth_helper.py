@@ -13,6 +13,8 @@ import os
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, expect
 
+from utils.harness_errors import HarnessConfigError
+
 logger = logging.getLogger(__name__)
 
 # Test credentials — read from environment ONLY. Never hardcode secrets in
@@ -71,7 +73,8 @@ def perform_login(
 
     Two-stage login (current, post late-2026):
         1. accounts.appypie.com/login  (legacy form)
-        2. authv2.flozic.ai/login      (Cognito Hosted UI second stage)
+        2. <cognito-host>/login        (Cognito Hosted UI second stage;
+                                       host list in pages.auth_state.AUTH_HOSTS)
 
     Stage 2 is handled automatically when `enable_authv2=True` (the default).
     The legacy /connects redirect frequently flashes the destination URL
@@ -91,7 +94,12 @@ def perform_login(
         logger.info("Skipping initial login-page navigation. Current URL: %s", page.url)
     else:
         logger.info("Navigating to login URL: %s", LOGIN_URL)
-        page.goto(LOGIN_URL)
+        # domcontentloaded, not 'load': /connects can hold the load event open
+        # for minutes (a 2026-08-20 run spent 180s waiting on it while the page
+        # was fully usable). Everything after this line waits on the URL
+        # pattern / concrete elements anyway, which is the readiness that
+        # actually matters.
+        page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
     # ── Login-route detection ─────────────────────────────────────────────────
     # If the current URL is on accounts.appypie.com/login, run the legacy
@@ -173,6 +181,65 @@ def perform_login(
                 "Page is on authv2 but handler reported it didn't run. "
                 "Caller may need to handle this manually. URL: %s", page.url,
             )
+
+    _verify_logged_in(
+        page, email, password, post_login_url_pattern, manual_fallback_minutes,
+    )
+
+
+def _verify_logged_in(
+    page: Page,
+    email: str,
+    password: str,
+    post_login_url_pattern,
+    manual_fallback_minutes: int,
+    grace_ms: int = 10_000,
+) -> None:
+    """Confirm the session actually exists before perform_login returns.
+
+    EVERY path through perform_login converges here. It has to, because the
+    stage-2 block used to just fall off its own end: when the authv2 handler
+    returned False and the page was not on a Cognito host (very common — the
+    URL is often mid-redirect at that instant), nothing was checked and
+    perform_login returned as though login had happened. Callers then logged
+    "Step 1 DONE: Logged in." and failed 20 seconds later on a dashboard
+    assertion, which reads as a product bug and scores as one.
+
+    A `grace_ms` wait rather than an instant check, because the OAuth redirect
+    chain is frequently still in flight when we get here.
+    """
+    try:
+        page.wait_for_url(post_login_url_pattern, timeout=grace_ms)
+        return
+    except Exception:
+        pass
+
+    # Not logged in. Distinguish the two causes, because they want opposite
+    # handling: missing configuration should fail immediately, whereas broken
+    # automation is what the manual-login window exists for.
+    missing = [
+        name for name, val in (("AUTOMATE_EMAIL", email), ("AUTOMATE_PASSWORD", password))
+        if not (val or "").strip()
+    ]
+    if missing:
+        raise HarnessConfigError(
+            f"Login did not happen: {' and '.join(missing)} not set, so no "
+            f"credentials were ever submitted. Set them in the environment or a "
+            f"gitignored .env. Current URL: {page.url}. "
+            f"NOTE: this is a harness configuration error, not a product defect "
+            f"— do not triage it as one."
+        )
+
+    logger.warning(
+        "Automated login did not reach the post-login URL (currently %s). "
+        "Credentials ARE set, so this is selector drift or a challenge screen. "
+        "Waiting up to %d minute(s) for manual login.",
+        page.url, manual_fallback_minutes,
+    )
+    page.wait_for_url(
+        post_login_url_pattern, timeout=manual_fallback_minutes * 60_000,
+    )
+    logger.info("Manual login completed. URL: %s", page.url)
 
 
 def _automated_login(

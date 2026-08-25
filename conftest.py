@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 import os
+import pathlib
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -21,8 +23,86 @@ from typing import Iterator
 import pytest
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
+
+def _load_dotenv(path: str = ".env") -> list[str]:
+    """Load KEY=VALUE lines from a gitignored .env into os.environ.
+
+    Runs BEFORE the utils/pages imports below, because credentials are read at
+    module scope (pages.auth_helper.DEFAULT_EMAIL) — after collection starts is
+    too late.
+
+    Existing environment variables always win, so an explicit
+    `FOO=bar pytest ...` still overrides the file.
+
+    WHY THIS EXISTS: auth_helper's own warning has always told people to use
+    "a gitignored .env", but nothing loaded one, so the only working path was
+    putting secrets on the command line. That leaks them into shell history and
+    into `ps` output for any other user on the box. This project has already had
+    to revoke credentials exposed that way. No dependency added — the format is
+    a handful of lines and python-dotenv is not worth a version to pin.
+    """
+    f = pathlib.Path(path)
+    if not f.is_file():
+        return []
+    loaded: list[str] = []
+    for raw in f.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Tolerate `export FOO=bar` so the same file can be `source`d by zsh.
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, val = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        val = val.strip()
+        # Strip one matched pair of surrounding quotes, so a value containing
+        # `#` or spaces survives. Anything else is passed through verbatim.
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        if not key:
+            continue
+        # Shell environment always wins over the file. But WITHIN the file,
+        # a later line overrides an earlier one — the least surprising
+        # semantics, and it matters in practice: a placeholder line like
+        # `AUTOMATE_PASSWORD=` followed by the real value would otherwise
+        # keep the empty one, and the resulting failure blames the env var
+        # the user just set.
+        if key in os.environ and key not in loaded:
+            continue
+        # Merged-line guard: a value that itself contains what looks like
+        # another VAR= assignment almost always means two variables were
+        # pasted onto one line with no newline between them. That exact
+        # mistake shipped OPENAI_API_KEY with "OPENAI_MODEL=gpt-4o" glued to
+        # its tail — surfacing only as an HTTP 401 mid-run, with the cause
+        # visible in nothing but the last four masked characters of OpenAI's
+        # error. Name it at load time instead.
+        if re.search(r"[A-Z][A-Z0-9_]{2,}=", val):
+            # logging directly: this runs at import time, before the module's
+            # own `logger` binding exists.
+            logging.getLogger(__name__).warning(
+                "[env] %s looks like TWO merged variables (its value contains "
+                "another NAME= assignment). Put each variable on its own line "
+                "in .env — this value is almost certainly wrong as-is.", key,
+            )
+        os.environ[key] = val
+        if key not in loaded:
+            loaded.append(key)
+    return loaded
+
+
+# Names only — never values. A log line is the wrong place for a secret.
+_DOTENV_KEYS = _load_dotenv()
+
 from utils.js_console_monitor import JsConsoleMonitor
 from utils.network_monitor import NetworkMonitor, export_run_overview
+from utils.harness_errors import HarnessError, looks_like_connectivity_loss
+from utils.mobile_report_builder import (
+    mobile_was_exercised as _mobile_ran,
+    session_findings as _mobile_findings,
+    session_check_stats as _mobile_check_stats,
+)
 from utils.snapshot_writer import add_test_record, write_snapshot, _STATE
 from utils.dashboard_builder import build as build_dashboard
 import utils.health_tracker as _ht
@@ -134,11 +214,34 @@ def browser_instance(request: pytest.FixtureRequest) -> Iterator[Browser]:
             logger.info("[session] %s closed", engine)
 
 
+# Populated during session teardown and consumed by the email report at the
+# very end, once every artifact it attaches has been written.
+_EMAIL_CONTEXT: dict = {}
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Repoint snapshot/dashboard/pdf module-level paths to a per-browser
     folder so parallel runs (e.g. chromium + firefox in two terminals) write
     to separate directories and never overwrite each other's results."""
     _retarget_report_paths(config)
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Announce what .env supplied.
+
+    In pytest_configure this line is emitted before the logging plugin
+    attaches its live-log handler, so it vanishes -- which defeats the point,
+    since answering "did my .env actually load?" is the only reason it exists.
+    sessionstart runs after every configure hook.
+    """
+    if _DOTENV_KEYS:
+        # Names only. Logging a value would defeat the point of the file.
+        logger.info("[env] Loaded from .env: %s", ", ".join(sorted(_DOTENV_KEYS)))
+    else:
+        logger.info(
+            "[env] No .env loaded (file absent or empty). Credentials must "
+            "come from the shell environment."
+        )
 
 
 def _report_root(config: pytest.Config) -> Path:
@@ -187,7 +290,7 @@ def _retarget_report_paths(config: pytest.Config) -> Path:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def session_teardown_snapshot() -> Iterator[None]:
+def session_teardown_snapshot(request: pytest.FixtureRequest) -> Iterator[None]:
     """
     At session end:
       1. Write v3-schema JSON snapshot (bridge for any Java tooling).
@@ -233,6 +336,18 @@ def session_teardown_snapshot() -> Iterator[None]:
 
     # ── 2. HTML dashboard ─────────────────────────────────────────────────
     try:
+        # AI triage of mobile findings runs BEFORE the dashboard/PDF are
+        # rendered so both can include it. Inert without a provider key;
+        # never raises; never touches scoring (AI observes, Python decides).
+        try:
+            from utils.ai_mobile_triage import triage_mobile_findings
+            if _mobile_ran():
+                triage_mobile_findings(
+                    _mobile_findings(),
+                    engine=request.config.getoption('--browser'),
+                )
+        except Exception as e:
+            logger.warning('[ai-mobile] triage failed (non-fatal): %s', e)
         dash_path = build_dashboard(records, started_at)
         logger.info("[session] Dashboard written: %s", dash_path)
     except Exception as e:
@@ -256,7 +371,15 @@ def session_teardown_snapshot() -> Iterator[None]:
         )
 
         clusters = _ht.get_clusters()
-        scores   = compute_scores(records, clusters)
+        # Mobile findings are fed in so they can move the score. Empty on a
+        # non-mobile run, which leaves Mobile as None and `overall` on the
+        # original v1 weighting -- the version bump is not a silent rescoring.
+        _cs = _mobile_check_stats()
+        _engine_cs = next(iter(_cs.values()), None) if _cs else None
+        scores   = compute_scores(records, clusters,
+                                  mobile_findings=_mobile_findings(),
+                                  mobile_tested=_mobile_ran(),
+                                  check_stats=_engine_cs)
 
         logger.info(
             "[session] Health Score: %d/100 | Product: %d | Infra: %d | Framework: %d | "
@@ -264,9 +387,47 @@ def session_teardown_snapshot() -> Iterator[None]:
             scores.overall, scores.product_health, scores.infra_health,
             scores.framework_health, len(clusters),
         )
+        if scores.mobile_health is not None:
+            logger.info(
+                "[session] Mobile: %d (scoring v%d) | findings: %d blocker, "
+                "%d major, %d minor",
+                scores.mobile_health, scores.scoring_version,
+                scores.mobile_blocker, scores.mobile_major, scores.mobile_minor,
+            )
+        else:
+            # Say it out loud. An absent Mobile line must not read as "mobile
+            # is fine" -- it means mobile was never exercised at all.
+            logger.info(
+                "[session] Mobile: not measured (no mobile tests in this run) — "
+                "excluded from the %d/100 overall, not scored as 100.",
+                scores.overall,
+            )
+        _fails = [r for r in records if r.status == "FAIL"]
+        _infra = [r for r in _fails if getattr(r, "harness_fault", False)]
+        logger.info(
+            "[session] Failure classification: %d product / %d infrastructure "
+            "(connectivity or harness config — excluded from Product health, "
+            "still fail the suite).",
+            len(_fails) - len(_infra), len(_infra),
+        )
+        if scores.harness_fault_count:
+            # Say this out loud. A product score computed over fewer tests
+            # than ran must not be allowed to read as full coverage.
+            logger.warning(
+                "[session] %d failure(s) were HARNESS faults, excluded from "
+                "product health — the product was not exercised by them. "
+                "Product: %d reflects only the %d test(s) that actually ran a "
+                "check.",
+                scores.harness_fault_count, scores.product_health,
+                len(records) - scores.harness_fault_count,
+            )
 
         pdf_path = build_pdf(records, stats, decision, scores, clusters, started_at)
         logger.info("[session] Report written: %s", pdf_path)
+
+        _EMAIL_CONTEXT.update(
+            stats=stats, decision=decision, scores=scores, records=records,
+        )
 
     except Exception as e:
         logger.error("[session] PDF/scores build failed: %s", e, exc_info=True)
@@ -282,6 +443,63 @@ def session_teardown_snapshot() -> Iterator[None]:
         logger.info("[session] Network overview: %s", overview_path)
     except Exception as e:
         logger.warning("[session] Network overview write failed: %s", e)
+
+    # Email the report LAST, so every artifact it attaches already exists.
+    # Wrapped like every other writer here: a mail failure must not turn a
+    # green run red. `_EMAIL_CONTEXT` is populated in the scores block above;
+    # if that block raised, there is nothing meaningful to report and we skip.
+    def _email_report() -> None:
+        if not _EMAIL_CONTEXT.get("stats"):
+            logger.info("[session] Email skipped — no run stats available.")
+            return
+        from utils import email_report, notifier
+        from utils.ai_exec_summary import summarize as _summarize
+
+        try:
+            narrative = _summarize(
+                _EMAIL_CONTEXT["stats"],
+                _EMAIL_CONTEXT["records"],
+                _EMAIL_CONTEXT["decision"].status.value,
+            )
+        except Exception:
+            narrative = ""
+
+        payload = email_report.build(
+            stats=_EMAIL_CONTEXT["stats"],
+            decision=_EMAIL_CONTEXT["decision"],
+            scores=_EMAIL_CONTEXT["scores"],
+            records=_EMAIL_CONTEXT["records"],
+            exec_summary=narrative,
+        )
+        status = notifier.send(
+            payload, failed=int(_EMAIL_CONTEXT["stats"].get("failed", 0) or 0)
+        )
+        logger.info("[session] Email report: %s", status)
+
+    # AI spend for the run — per-module attribution plus the session total.
+    # Written even when zero calls were made, so a run with AI disabled is
+    # distinguishable from a run where the export failed.
+    try:
+        from utils import ai_cost_tracker
+        from utils.snapshot_writer import SNAPSHOT_PATH as _SNAPSHOT
+        cost_path = ai_cost_tracker.export_to(_SNAPSHOT.parent / "run_summary")
+        totals = ai_cost_tracker.TRACKER.summary()["session"]
+        if totals["calls"]:
+            logger.info(
+                "[session] AI spend: $%.4f across %d call(s) "
+                "(%d in / %d out tokens) → %s",
+                totals["usd"], totals["calls"],
+                totals["input_tokens"], totals["output_tokens"], cost_path,
+            )
+        else:
+            logger.info("[session] AI spend: no AI calls this run.")
+    except Exception as e:
+        logger.warning("[session] AI cost report write failed: %s", e)
+
+    try:
+        _email_report()
+    except Exception as e:
+        logger.warning("[session] Email report failed: %s", e)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -307,9 +525,17 @@ def page(
     # for --start-maximized to take effect. Firefox/WebKit don't support
     # --start-maximized, so we give them an explicit viewport instead.
     engine = request.config.getoption("--browser")
+    headless = request.config.getoption("--headless")
+    # no_viewport is only meaningful HEADED: it lets --start-maximized size the
+    # real OS window. Headless Chromium has no OS window and silently defaults
+    # to 800x600 — which is what every headless run in this project actually
+    # ran at until 2026-08-20, when the marketing header redesign collapsed
+    # the navbar at that width and three login tests plus the dashboard
+    # logout "went hidden". A fixture-context probe (vw=800) exposed it; the
+    # branch keyed on engine when it needed to key on engine AND headedness.
     ctx_kwargs: dict = (
         {"no_viewport": True}
-        if engine == "chromium"
+        if engine == "chromium" and not headless
         else {"viewport": {"width": 1440, "height": 900}}
     )
     if record_video:
@@ -500,6 +726,18 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> objec
     outcome = yield
     rep = outcome.get_result()  # type: ignore[attr-defined]
     setattr(item, f"rep_{rep.when}", rep)
+    # Tag harness faults so scoring can keep them out of product health. This
+    # is the only place the exception TYPE is still available — by teardown
+    # there is just a formatted longrepr string, and pattern-matching a message
+    # would break the moment someone rewords it.
+    if call.excinfo is not None and (
+        isinstance(call.excinfo.value, HarnessError)
+        # A lost network is the same non-signal as a missing env var: the
+        # product was never reached. Detected from the message because
+        # Playwright raises its own error type carrying the Chromium code.
+        or looks_like_connectivity_loss(str(call.excinfo.value))
+    ):
+        setattr(item, "harness_fault", True)
     return rep
 
 
@@ -554,6 +792,21 @@ def _capture_failure_artifacts(page: Page, test_name: str) -> str:
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _test_failed(node) -> bool:
+    """True when the test's CALL failed OR its SETUP errored.
+
+    Judging by rep_call alone recorded setup errors as passes: in the
+    2026-08-19 full run, 8 tests that ERRORed on net::ERR_INTERNET_DISCONNECTED
+    inside a class fixture's goto were written to the snapshot as PASS and
+    rendered green on the dashboard. A test whose setup died did not pass.
+    """
+    for phase in ("rep_call", "rep_setup"):
+        rep = getattr(node, phase, None)
+        if rep is not None and rep.failed:
+            return True
+    return False
+
+
 def _record_outcome(
     request: pytest.FixtureRequest,
     failed: bool,
@@ -563,6 +816,10 @@ def _record_outcome(
     """Push the test result to the snapshot writer."""
     rep = getattr(request.node, "rep_call", None)
     duration_ms = int((rep.duration if rep else 0) * 1000)
+    # The caller derives `failed` from rep_call; widen it to setup errors.
+    # (The net:: ones already carry harness_fault from the makereport hook,
+    # so they land as infrastructure, not product.)
+    failed = failed or _test_failed(request.node)
 
     # Pull TestCategory metadata if the class supplied it via @test_category.
     cls = request.node.cls
@@ -608,4 +865,5 @@ def _record_outcome(
         artifact_folder=artifact_folder,
         video_path=video_path,
         cohort=cohort,
+        harness_fault=bool(getattr(request.node, "harness_fault", False)),
     )

@@ -29,7 +29,7 @@ Usage:
     rows = generate_form_data(spec, n=50)
     # rows is list[dict]; every row passed validation; bad rows already filtered.
 
-If OPENAI_API_KEY is not set, returns the cached version if present, else [].
+With no AI provider configured, returns the cached version if present, else [].
 """
 
 from __future__ import annotations
@@ -45,9 +45,8 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
-API_BASE = "https://api.openai.com/v1/chat/completions"
-REQUEST_TIMEOUT_S = 60
+MODULE = "ai_form_data"
+DEFAULT_MODEL = None   # provider default; override per call with model=
 
 # Cache root — alongside the AI prompt cache, gitignored.
 CACHE_DIR = Path(__file__).resolve().parents[1] / "cache" / "synthetic_data"
@@ -314,20 +313,22 @@ def _validate_rows(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OpenAI call
+# Provider call
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _gpt_generate(
-    fields: list[ResolvedField], n: int, model: str,
+def _ai_generate(
+    fields: list[ResolvedField], n: int, model: str | None = None,
     strict_retry: bool = False,
 ) -> list[Any]:
-    """Send the field spec to GPT, return parsed rows array. [] on failure."""
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return []
-    try:
-        import requests  # type: ignore
-    except ImportError:
+    """Send the field spec to the model, return the parsed rows array.
+
+    Returns [] on any failure — the caller falls back to cached or
+    deterministic data rather than failing the test on a data-gen problem.
+    """
+    from utils.ai_parser import send_json
+    from utils.ai_provider import PROVIDER_NAME
+
+    if PROVIDER_NAME == "noop":
         return []
 
     schema_text = "\n".join(
@@ -360,37 +361,23 @@ def _gpt_generate(
         "as keys.".replace("{n}", str(n))
     )
 
-    payload = {
-        "model": model,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": sys_msg},
-            {"role": "user",   "content": user_msg},
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-    }
-
-    try:
-        resp = requests.post(API_BASE, json=payload, headers=headers,
-                             timeout=REQUEST_TIMEOUT_S)
-    except Exception as e:
-        logger.error("[synthetic] OpenAI request failed: %s", e)
+    outer, resp = send_json(
+        user_msg,
+        module=MODULE,
+        model=model,
+        system_prompt=sys_msg,
+        # n rows of m fields — scales with the request, unlike a verdict.
+        max_tokens=4096,
+    )
+    if resp is not None and resp.error:
+        logger.error("[synthetic] %s request failed: %s", resp.provider, resp.error)
         return []
-    if resp.status_code != 200:
-        logger.error("[synthetic] OpenAI HTTP %d: %s",
-                     resp.status_code, resp.text[:300])
+    if not isinstance(outer, dict):
+        logger.error("[synthetic] model returned unparseable JSON.")
         return []
 
-    try:
-        outer = json.loads(resp.json()["choices"][0]["message"]["content"])
-        rows  = outer.get("rows") or outer.get("data") or outer.get("items") or []
-        return rows if isinstance(rows, list) else []
-    except (KeyError, ValueError, json.JSONDecodeError) as e:
-        logger.error("[synthetic] parse error: %s", e)
-        return []
+    rows = outer.get("rows") or outer.get("data") or outer.get("items") or []
+    return rows if isinstance(rows, list) else []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -432,7 +419,7 @@ def generate_form_data(
         return cached
 
     # First attempt
-    raw_rows = _gpt_generate(fields, n, use_model, strict_retry=False)
+    raw_rows = _ai_generate(fields, n, use_model, strict_retry=False)
     report   = _validate_rows(raw_rows, fields)
     logger.info(
         "[synthetic] attempt 1: %d accepted, %d rejected (rate=%.2f)",
@@ -451,7 +438,7 @@ def generate_form_data(
             "with strict mode.",
             report.accept_rate, min_valid_fraction,
         )
-        raw_rows = _gpt_generate(fields, n, use_model, strict_retry=True)
+        raw_rows = _ai_generate(fields, n, use_model, strict_retry=True)
         report   = _validate_rows(raw_rows, fields)
         logger.info(
             "[synthetic] attempt %d: %d accepted, %d rejected (rate=%.2f)",

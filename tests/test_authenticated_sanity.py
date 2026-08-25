@@ -27,6 +27,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from pages.auth_helper import perform_login
+from pages.auth_state import is_on_auth_host
 from pages.dashboard_page import ConnectEditorPage, DashboardPage
 from pages.wait_utils import complete_user_guide, dismiss_overlays
 from utils.test_category import test_category
@@ -85,7 +86,10 @@ class TestAuthenticatedSanityJourney:
 
         # Step 5: Logout and verify redirect
         dashboard.click_logout()
-        assert ("authv2.flozic.ai" in page.url or "accounts.appypie.com" in page.url), (
+        # Host-agnostic: the Cognito Hosted UI has been renamed once already
+        # (authv2.flozic.ai → accounts.flozic.ai). Assert on the shared host
+        # list so a future rename is one edit in pages/auth_state.py.
+        assert is_on_auth_host(page.url), (
             f"Did not redirect to a login page after logout. URL: {page.url}"
         )
         logger.info("Step 5 DONE: Logout successful — redirected to: %s", page.url)

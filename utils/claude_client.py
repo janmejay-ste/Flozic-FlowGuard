@@ -12,7 +12,6 @@ without the `anthropic` package installed can still run OpenAI-backed tests.
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -126,16 +125,17 @@ def send(
 
     if response_json:
         # Claude sometimes wraps JSON in ```json fences even when the prompt
-        # asks for raw JSON. Strip common fences before parsing.
-        stripped = _strip_json_fences(text)
-        try:
-            resp.parsed_json = json.loads(stripped)
-        except (ValueError, TypeError) as e:
+        # asks for raw JSON, and occasionally adds a sentence around it.
+        # utils/ai_parser handles fences, prose, and the usual malformations
+        # in one place so both providers behave identically here.
+        from utils.ai_parser import parse_json
+        parsed = parse_json(text)
+        if parsed is None and text:
             logger.warning(
-                "[claude] response_json=True but text was not valid JSON: %s "
-                "(first 120 chars: %r)", e, stripped[:120],
+                "[claude] response_json=True but text was not valid JSON "
+                "(first 120 chars: %r)", text[:120],
             )
-            resp.parsed_json = None
+        resp.parsed_json = parsed if isinstance(parsed, dict) else None
     return resp
 
 
@@ -162,14 +162,7 @@ def _image_block(path: Path) -> dict[str, Any] | None:
 
 
 def _strip_json_fences(text: str) -> str:
-    """Remove ```json ... ``` fences that Claude sometimes emits even when
-    asked for raw JSON. Idempotent on already-clean strings."""
-    s = text.strip()
-    if s.startswith("```"):
-        # Drop the opening fence line (```json or just ```).
-        newline = s.find("\n")
-        if newline != -1:
-            s = s[newline + 1:]
-    if s.endswith("```"):
-        s = s[:-3].rstrip()
-    return s
+    """Deprecated shim — fence handling moved to `utils.ai_parser` so both
+    providers share one implementation. Kept for any external caller."""
+    from utils.ai_parser import strip_json_fences
+    return strip_json_fences(text)

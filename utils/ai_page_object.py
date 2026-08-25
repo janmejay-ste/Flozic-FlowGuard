@@ -20,18 +20,15 @@ before promoting `.new.py` → `.py`.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
-API_BASE = "https://api.openai.com/v1/chat/completions"
-REQUEST_TIMEOUT_S = 90
+MODULE = "ai_page_object"
+
 
 # Hard cap on the DOM snippet sent to GPT. Keeps token cost bounded on
 # very large pages.
@@ -204,21 +201,17 @@ def generate_page_object(
     model: str | None = None,
 ) -> GeneratedPageObject:
     """
-    Send a DOM excerpt to GPT, return a draft Page Object as a Python string
-    plus a manual-review checklist. Returns SKIPPED with empty code when
-    OPENAI_API_KEY is unset (the caller should print the reason and exit 0).
+    Send a DOM excerpt to the model, return a draft Page Object as a Python
+    string plus a manual-review checklist. Returns SKIPPED with empty code
+    when no AI provider is configured (the caller prints the reason, exit 0).
     """
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
+    from utils.ai_parser import send_json
+    from utils.ai_provider import PROVIDER_NAME
+
+    if PROVIDER_NAME == "noop":
         return GeneratedPageObject(
             status="SKIPPED",
-            error="OPENAI_API_KEY not set; page-object generator skipped.",
-        )
-    try:
-        import requests  # type: ignore
-    except ImportError:
-        return GeneratedPageObject(
-            status="ERROR", error="'requests' not installed.",
+            error="No AI provider configured; page-object generator skipped.",
         )
 
     excerpt = extract_dom_excerpt(dom_html)
@@ -228,35 +221,21 @@ def generate_page_object(
             error="No interactive elements found in the provided HTML.",
         )
 
-    payload = {
-        "model": model or DEFAULT_MODEL,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": _system_prompt()},
-            {"role": "user",   "content": _user_prompt(
-                class_name, excerpt, source_label)},
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-    }
-
-    try:
-        resp = requests.post(API_BASE, json=payload, headers=headers,
-                             timeout=REQUEST_TIMEOUT_S)
-    except Exception as e:
-        return GeneratedPageObject(status="ERROR", error=str(e))
-    if resp.status_code != 200:
+    parsed, resp = send_json(
+        _user_prompt(class_name, excerpt, source_label),
+        module=MODULE,
+        model=model,
+        system_prompt=_system_prompt(),
+        # Codegen output is far larger than a verdict — a class with a dozen
+        # methods overruns the 2048 default and comes back truncated.
+        max_tokens=8192,
+    )
+    if resp is not None and resp.error:
+        return GeneratedPageObject(status="ERROR", error=resp.error)
+    if not isinstance(parsed, dict):
         return GeneratedPageObject(
-            status="ERROR",
-            error=f"HTTP {resp.status_code}: {resp.text[:300]}",
+            status="ERROR", error="Model returned unparseable JSON.",
         )
-
-    try:
-        parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
-    except (KeyError, ValueError, json.JSONDecodeError) as e:
-        return GeneratedPageObject(status="ERROR", error=f"parse: {e}")
 
     code = str(parsed.get("code", "")).strip()
     if not code:

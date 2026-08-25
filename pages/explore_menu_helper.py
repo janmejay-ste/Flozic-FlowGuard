@@ -24,6 +24,7 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 import pytest
 
 from pages.auth_helper import perform_login
+from pages.auth_state import is_on_auth_host
 from pages.dashboard_page import DashboardPage
 from utils.config import MARKETING_BASE
 
@@ -148,7 +149,7 @@ def run_link_iteration(
     logger.info("%s Automate clicked — current URL: %s", log_prefix, page.url)
 
     # 3. Auth redirect handling
-    if "accounts.appypie" in page.url or "register" in page.url:
+    if is_on_auth_host(page.url) or "register" in page.url:
         logger.info("%s Auth redirect — handling login", log_prefix)
         perform_login(page)
         # Give session cookies time to propagate across domains before
@@ -165,7 +166,7 @@ def run_link_iteration(
         # If a second auth redirect occurs (race condition), wait it out —
         # the build-your-connect URL should redirect to the editor once
         # the server-side session validates on retry.
-        if "accounts.appypie" in page.url or "register" in page.url:
+        if is_on_auth_host(page.url) or "register" in page.url:
             logger.info(
                 "%s Second auth redirect after re-click — waiting for editor via URL poll",
                 log_prefix,

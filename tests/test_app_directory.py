@@ -67,7 +67,26 @@ class TestAppDirectory:
         )
 
     def test_scroll_loading_works(self) -> None:
+        # Baseline AFTER hydration settles. The page server-renders ~240 cards
+        # and client-side hydration replaces the grid with ~187 from
+        # /api/apps; sampling before that finishes made this test fail on a
+        # count "decrease" that scrolling had nothing to do with (240 -> 187,
+        # byte-identical across three runs). The static-vs-D1 catalog gap is a
+        # real product finding tracked separately — this test's subject is
+        # scroll behaviour, so it must start from the hydrated state.
         initial = self._app_dir.get_integration_card_count()
+        for _ in range(12):
+            self._page.wait_for_timeout(500)
+            now = self._app_dir.get_integration_card_count()
+            if now == initial:
+                break
+            if now < initial:
+                logger.warning(
+                    "[hydration] card grid shrank %d -> %d before any scroll — "
+                    "static HTML and the /api/apps catalog disagree (known "
+                    "product finding).", initial, now,
+                )
+            initial = now
         self._app_dir.scroll_to_bottom()
         # Poll until the count stabilises (handles brief DOM churn during re-render)
         stable_after = initial

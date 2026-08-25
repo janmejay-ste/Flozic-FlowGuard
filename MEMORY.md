@@ -151,10 +151,112 @@ reports/              → gitignored; generated per run
 
 ## Product bugs currently tracked
 
+### ⚠️ Auth host migrated — `authv2.flozic.ai` → `accounts.flozic.ai` (fixed 2026-08-11)
+
+The Cognito Hosted UI was renamed. Seven host gates still hardcoded the old
+name, so `is_on_authv2()` returned False on a page that *was* the Cognito
+login — and stage-2 login was **silently skipped**. Every authenticated test
+then failed on an assertion it could never satisfy, and `[AI-triage]` called
+eight of them `PRODUCT_BUG confidence=0.9 severity=major`. They were all one
+framework bug.
+
+Fixed by centralising the host list in `pages/auth_state.py`:
+
+```python
+AUTH_HOSTS = ("accounts.flozic.ai", "authv2.flozic.ai", "accounts.appypie.com")
+# override for a staging IdP:  FLOZIC_AUTH_HOSTS="host-a,host-b"
+```
+
+Sites updated: `auth_state.is_on_idp`, `authv2_helper.COGNITO_HOSTS` +
+its `wait_for_url`, `signup_to_login_switch` (×3 — constant, DOM fallback,
+post-click wait), `dashboard_page` logout redirect. **When the host moves
+again, `AUTH_HOSTS` should be the only edit.**
+
+Verified live: the signup→login recovery runs end-to-end on
+`accounts.flozic.ai` and the `input[name='username']` / `Next` selectors are
+unchanged — only the hostname moved.
+
+**Two things this exposed, both still open:**
+
+1. `handle_authv2_login_if_present()` returning `False` means both "login not
+   needed" and "couldn't recognise the login page". Callers treat both as
+   success and log `Step 9: Login complete` — which is how a total auth
+   failure produced a green-looking log line for ~8 tests. Worth making the
+   authenticated tests assert a logged-in state instead of trusting `False`.
+2. The triage prompt has no clause for "the harness skipped a step", so it
+   attributes harness failures to the product with high confidence. It routes
+   AI-plumbing errors to INFRA already; login-helper skips need the same.
+
+### Conversational-agent coverage removed (2026-08-11)
+
+The `/agents/conversational/*` → `/agent/builder` flow is **no longer tested in
+this repo** — a separate automation suite owned by another engineer covers it.
+Don't re-add it here without checking that ownership first.
+
+Removed, all of it agent-only and referenced by nothing else:
+
+- the 5 `tests/test_flozic_agent_*.py` files
+- the 5 `"kind": "agent"` entries in `tests/flozic_prompts.json` (22 → 17)
+- `open_conversational_agent()`, `wait_for_agent_builder()`,
+  `CONVERSATIONAL_AGENT_URL`, `AGENT_BUILDER_URL_PATTERN` in
+  `pages/flozic_landing_page.py`
+- the `kind == "agent"` branching in `tests/_flozic_common.py` (the `kind`
+  config key is gone; every flow is now the app flow)
+
+Recoverable from git history if it's ever needed back.
+
+**Kept:** the `/signup` → `/login` recovery in `authv2_helper` +
+`signup_to_login_switch`. The agent flow was where it was first observed, but
+the GoHighLevel entry point hits the same misroute and the recovery is what
+makes that test pass.
+
+**One thing that was never verified and is now moot here** — worth passing to
+whoever owns the replacement suite: the agent success gate only ever waited for
+`**/agent/builder**` and asserted nothing about the page. On 2026-08-11 that URL
+matched transiently and the app then redirected to `/agent/login`, so all five
+tests XPASSed without the builder UI necessarily rendering. A gate on that flow
+should assert a builder element *after* the URL settles.
+
+### ⚠️ Never ask a model for a boolean you can compute (fixed 2026-08-11)
+
+`ai_popup_validator` v1 asked the model for `is_valid`, defined as "true iff
+categories match AND plan names correctly mentioned" — a conjunction over four
+fields it was already reporting separately. On the 2026-08-11 run all six
+pricing variants produced byte-identical observations:
+
+```
+expected=BLOCK  observed=BLOCK  mentions_current=True  mentions_target=False
+```
+
+...and the model answered `true` for the three yearly variants and `false` for
+the three monthly ones. Same evidence, opposite verdicts, at `temperature=0`.
+Three tests failed as major product bugs on a coin flip.
+
+**Fix:** the model reports observations; `ai_popup_validator._decide()` applies
+the policy in Python. Prompt `pricing_popup_validation` bumped to **v2** with
+`is_valid` removed. Policy is now explicit and diffable:
+
+- `BLOCK` / `BLOCK_PERIOD` must name the **current** plan (that is the message's
+  substance) — they are NOT required to name the target. Requiring it was the
+  actual defect.
+- `CONFIRM_*` / `CHECKOUT` must name the **target** plan.
+
+23 unit tests in `tests/unit/test_popup_verdict_policy.py` pin this, including a
+determinism guard that runs `_decide()` 50× on identical input.
+
+**The general lesson, which applies to the rest of the AI layer:** anything a
+model reports separately should not also be summarised by the model into a
+verdict. Let it observe; decide in code.
+
+### Product bugs currently tracked
+
 | Bug | Status | Test evidence |
 |---|---|---|
 | Agent flow was misrouting `/agents/conversational/*` to `/connects` instead of `/agent/builder` | **FIXED on product side (~2026-06-26)** | 5 agent tests now reach `/agent/builder?agent=chat` |
-| Agent OAuth lands on `authv2.flozic.ai/signup` instead of `/login` | **ACTIVE** — auto-recovered in `authv2_helper.py` via signup→login switch | `[ISSUE]` warning fires for every agent test |
+| Agent OAuth lands on `<cognito-host>/signup` instead of `/login` | **ACTIVE** — auto-recovered in `authv2_helper.py` via signup→login switch. The recovery was dead between the host rename and 2026-08-11 (the host gate returned before reaching it) | `[ISSUE]` warning fires for every agent test |
+| Conversational-agent `/agents/conversational/*` flows | **NO LONGER TESTED HERE — removed 2026-08-11.** Covered by a separate automation suite owned by someone else. See "Conversational-agent coverage removed" below | — |
+| GoHighLevel entry point routes to `/register`, dropping the prompt param | **FIXED — un-xfailed 2026-08-11.** XPASSed the full path: straight to `/login`, editor opened, copilot reported "Connect created!" with the right trigger+action, canvas verdict VALID. Marker removed so a regression fails loudly. If it fails again, check the `/register` misroute first | `test_flozic_gohighlevel` |
+| Copilot never emits "Connect created" for some apps | **ACTIVE — likely product.** 4 apps (acculynx, google-sheets, lightspeedxseries, telegram) time out at 180s with the editor open and the copilot panel up. `gohighlevel` gets the message in **7s** on the same code path, so the mechanism works — these four stall | 4 `test_flozic_*` tests, 2026-08-11 |
 | ChatGPT workflow action defaults to "Create image" regardless of prompt | **ACTIVE product bug** — AI/Workflow team | Recurring in `test_flozic_chatgpt_connect` and `test_flozic_diversified[chatgpt-*]` |
 | HubSpot trigger picks "Deal" when prompt says "Lead" | **ACTIVE** — matrix-aware AI validator flags this correctly | `test_flozic_diversified[paypal-v1]` (variant with HubSpot Lead trigger) |
 | Cliniko trigger picks wrong event ("archived" instead of "scheduled") | **ACTIVE** | `test_flozic_diversified[cliniko-v1/v2]` |
@@ -184,16 +286,38 @@ reports/              → gitignored; generated per run
 - **2c next:** Dashboard root-cause card — "3 root causes affecting 12 tests"
 - Add `docs/fingerprinting.md` when 2b lands.
 
-### Phase 1 — Provider abstraction (pilot landed, rollout pending)
+### Phase 1 — Provider abstraction (COMPLETE, 2026-08-07)
 - `utils/claude_client.py` + `utils/ai_provider.py` shipped
-- `utils/ai_validator.py` refactored as pilot (uses provider abstraction)
-- **Pending:** roll out to 8 remaining ai_*.py modules
-  (`ai_triage`, `ai_popup_validator`, `ai_visual_diff`, `ai_exec_summary`,
-   `ai_prompt_generator`, `ai_pr_review`, `ai_page_object`, `ai_form_data`)
-- Before the rollout, extract shared utilities:
-  - `utils/ai_prompts.py` — prompt template registry
-  - `utils/ai_parser.py` — JSON repair + retry-on-malformed
-  - `utils/ai_cost_tracker.py` — per-call cost, session cap, module attribution
+- Shared utilities extracted:
+  - `utils/ai_prompts.py` — versioned prompt registry (`string.Template`,
+    `$name` placeholders; a literal `$` in a template must be `$$`).
+    Holds the canvas, popup, triage, visual-diff, exec-summary and PR-review
+    prompts plus the PlanChangeService matrix and the review rule list.
+    Bump a template's `version` when wording could move verdicts — triage
+    writes it into `triage.json` as `evidence.prompt_version`.
+  - `utils/ai_parser.py` — tolerant JSON (`parse_json`) + `send_json()` /
+    `send_text()`. Handles fences, prose-wrapped JSON, trailing commas,
+    Python literals, smart quotes; one corrective retry on a parse miss.
+    Returns None rather than guessing — a wrong verdict is worse than none.
+  - `utils/ai_cost_tracker.py` — per-call USD, module attribution (inferred
+    from the call stack), session cap, `ai-cost.json` at schema_version 1.
+- **All 8 remaining ai_*.py modules rolled over.** No module calls an LLM
+  HTTP endpoint directly any more — the only `api.openai.com` reference left
+  in the repo is the OpenAI adapter inside `ai_provider.py`, which is correct.
+- Metering + the budget gate live in `ai_provider.send()`, so they apply to
+  every caller automatically. Over-budget degrades to the SKIPPED path each
+  module already handles; tests keep running.
+- New env vars: `FLOZIC_AI_COST_CAP_USD` (session ceiling, unset = no cap),
+  `FLOZIC_AI_COST_DISABLED=1` (turn accounting off).
+- Session teardown writes `reports/trend/run_summary/ai-cost.json` and logs
+  a one-line spend summary.
+- Unit tests: 67 passing (was 21) — `tests/unit/test_ai_parser.py` and
+  `tests/unit/test_ai_cost.py` added.
+
+**Pricing note:** `claude-sonnet-5` (the default Claude model) is on
+introductory pricing of $2/$10 per MTok **through 2026-08-31**, reverting to
+$3/$15. The cost tracker encodes both and picks by date, so September runs
+report the real rate without a code change.
 
 ### New tests added this branch
 - 11 new prompt-based UI tests (6 new integration apps + 5 conversational agents)
@@ -209,10 +333,10 @@ understanding gives more ROI than AI-powered clicking for this framework's
 maturity level.
 
 ```
-Phase 1 — Provider Foundation                    ← IN PROGRESS
+Phase 1 — Provider Foundation                    ← COMPLETE (2026-08-07)
   ├── Provider abstraction (LANDED)
-  ├── Extract ai_prompts / ai_parser / ai_cost_tracker (NEXT)
-  └── Roll out to remaining 8 ai_*.py modules
+  ├── Extract ai_prompts / ai_parser / ai_cost_tracker (LANDED)
+  └── Roll out to remaining 8 ai_*.py modules (LANDED)
 
 Phase 3 — Failure Analyzer                       ← HIGHEST ROI NEXT
   ├── 3a. Failure Investigator (structured root-cause analysis)
@@ -256,11 +380,26 @@ Do not violate these without explicit user approval:
 
 ## How the current session ended
 
-- Phase 1 pilot committed at `ad6fb0f` (local, push blocked by 404).
-- `authv2_helper.py` now auto-recovers when OAuth lands on `/signup`.
-- Provider abstraction lets you switch to Claude with 2 env vars.
-- Next commit should extract the shared AI utilities before rolling out
-  the provider abstraction to the remaining 8 ai_*.py modules.
+Session of 2026-08-07 (fresh clone on a new Mac):
+
+- Confirmed `ad6fb0f` and `0d25674` are both on the remote and merged into
+  the default branch via PR #3 — the earlier "push blocked by 404" note was
+  stale.
+- **Phase 1 is done.** Shared utilities extracted and the provider
+  abstraction rolled out to all 8 remaining ai_*.py modules. See the
+  Phase 1 section above for what landed and the new env vars.
+- Unit suite grew 21 → 67, all passing in ~0.1s.
+- Nothing has been run against the live product this session —
+  `AUTOMATE_EMAIL` / `AUTOMATE_PASSWORD` / `ANTHROPIC_API_KEY` were unset,
+  so every AI path took the noop branch. The rollout is verified by unit
+  tests and a stubbed-transport integration check, **not** by a live run.
+  Do a headed smoke run before trusting verdict behaviour end-to-end.
+
+### Next
+Phase 3 (Failure Analyzer) is the highest-ROI item and now has the
+foundation it needs: `send_json()` for structured verdicts, the prompt
+registry for versioned prompts, and cost attribution so an expensive
+investigator agent is visible rather than a surprise.
 
 ## How to resume on a new device
 

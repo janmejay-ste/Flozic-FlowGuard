@@ -79,36 +79,5 @@
     "url_slug": "whatsappbusiness",
     "prompt": "When a new WhatsApp Business message arrives, log it in Google Sheets and notify the team in Slack.",
     "expected_trigger": "WhatsApp"
-  },
-
-  "discord-bot-maker-free": {
-    "kind": "agent",
-    "url_slug": "discord-bot-maker-free",
-    "prompt": "Build a Discord bot that greets new members in #welcome and answers FAQ questions about our product.",
-    "expected_trigger": "Discord"
-  },
-  "whatsapp-bot": {
-    "kind": "agent",
-    "url_slug": "whatsapp-bot",
-    "prompt": "Build a WhatsApp bot that captures customer name, email, and inquiry, then forwards the request to our sales team.",
-    "expected_trigger": "WhatsApp"
-  },
-  "telegram-bot": {
-    "kind": "agent",
-    "url_slug": "telegram-bot",
-    "prompt": "Build a Telegram bot that sends daily reminders to subscribers and tracks their responses.",
-    "expected_trigger": "Telegram"
-  },
-  "twitter-bot": {
-    "kind": "agent",
-    "url_slug": "twitter-bot",
-    "prompt": "Build a Twitter bot that auto-replies to brand mentions with a thank-you message and logs the user.",
-    "expected_trigger": "Twitter"
-  },
-  "facebook-messenger-bot": {
-    "kind": "agent",
-    "url_slug": "facebook-messenger-bot",
-    "prompt": "Build a Facebook Messenger bot that answers product FAQs and books appointments for our team.",
-    "expected_trigger": "Facebook"
   }
 }

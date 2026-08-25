@@ -53,6 +53,11 @@ class TestRecord:
     # ad-hoc experimental migrations during the observation window.
     # See docs/observation-protocol.md.
     cohort: str = "baseline"
+    # True when the failure was a harness fault (see utils/harness_errors).
+    # In-memory only — deliberately absent from _test_record_to_json, because
+    # the emitted JSON is a schema-3 contract shared with the Java side and
+    # this flag is for local scoring, not cross-stack exchange.
+    harness_fault: bool = False
 
 
 @dataclass
@@ -78,6 +83,7 @@ def add_test_record(
     artifact_folder: str | None = None,
     video_path: str | None = None,
     cohort: str = "baseline",
+    harness_fault: bool = False,
 ) -> None:
     """Record one test result. Thread-safe."""
     with _STATE.lock:
@@ -93,6 +99,7 @@ def add_test_record(
                 artifact_folder=artifact_folder,
                 video_path=video_path,
                 cohort=cohort,
+                harness_fault=harness_fault,
             )
         )
 

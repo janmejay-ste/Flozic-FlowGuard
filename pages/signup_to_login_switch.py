@@ -20,15 +20,20 @@ import logging
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
+from pages.auth_state import AUTH_HOSTS, is_on_auth_host
+
 logger = logging.getLogger(__name__)
 
 SIGNUP_PATH_FRAGMENTS = ("/register", "/signup")
-SIGNUP_HOST_FRAGMENTS = ("accounts.appypie", "authv2.flozic.ai")
+# Hosts that can serve a signup form. Sourced from the shared AUTH_HOSTS so a
+# host rename only has to be made in one place; "accounts.appypie" stays as a
+# prefix match because the legacy host appears with and without the .com.
+SIGNUP_HOST_FRAGMENTS = ("accounts.appypie",) + AUTH_HOSTS
 
 
 def _has_signup_dom_markers(page: Page) -> bool:
     """
-    DOM-based fallback: the authv2.flozic.ai Cognito Hosted UI renders the
+    DOM-based fallback: the Cognito Hosted UI renders the
     signup form at the root URL (no /signup path), so URL-only detection
     misses it. Identify the signup form by its content — 'Confirm password'
     input, the 'Sign up' submit button, OR the 'Have an account already?'
@@ -63,8 +68,10 @@ def is_on_signup(page: Page) -> bool:
     on_signup_host = any(h in url for h in SIGNUP_HOST_FRAGMENTS)
     if on_signup_path and on_signup_host:
         return True
-    # Fallback: authv2 host + signup-specific DOM markers.
-    if "authv2.flozic.ai" in url and _has_signup_dom_markers(page):
+    # Fallback: a Cognito host + signup-specific DOM markers. The Hosted UI can
+    # render signup at the root URL with no /signup path, so the URL check above
+    # misses it.
+    if is_on_auth_host(url) and _has_signup_dom_markers(page):
         return True
     return False
 
@@ -129,11 +136,13 @@ def switch_signup_to_login_if_needed(
             link.wait_for(state="visible", timeout=1_500)
             link.click(timeout=5_000)
             logger.info("Clicked signup->login switch link via selector: %s", sel)
-            # Wait for the URL to flip to a /login path on EITHER host.
+            # Wait for the URL to flip to a /login path on any known auth host.
+            # The Hosted UI's "Sign in" link is RELATIVE (/login?client_id=...),
+            # so the flip stays on whichever host we were already on — this
+            # check must accept all of them, not just the old one.
             try:
                 page.wait_for_url(
-                    lambda u: ("/login" in (u or ""))
-                              and ("accounts.appypie" in u or "authv2.flozic.ai" in u),
+                    lambda u: ("/login" in (u or "")) and is_on_auth_host(u),
                     timeout=timeout_ms,
                 )
             except PlaywrightTimeoutError:

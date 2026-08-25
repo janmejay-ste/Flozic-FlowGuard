@@ -7,18 +7,18 @@ Workflow per test:
      (NOTE: baselines/ lives at the REPO root, not under reports/, so it
       survives `reports/` cleanups and lives in git.)
   3. If baseline missing                       -> FIRST_RUN  (caller promotes later)
-  4. If bytes identical                        -> IDENTICAL  (no GPT call needed)
-  5. If bytes differ, send both to GPT for     -> COSMETIC | REGRESSION | UNKNOWN
-     semantic classification.
+  4. If bytes identical                        -> IDENTICAL  (no AI call needed)
+  5. If bytes differ, send both to the model   -> COSMETIC | REGRESSION | UNKNOWN
+     for semantic classification.
 
 States (per user spec):
   FIRST_RUN   - no baseline yet (first time we see this test)
   IDENTICAL   - byte-equal screenshots
-  COSMETIC    - GPT thinks the change is color/spacing/font-rendering noise
-  REGRESSION  - GPT thinks an element changed/moved/disappeared
-  UNKNOWN     - GPT is uncertain (we asked for this explicitly to avoid
+  COSMETIC    - the model reads the change as color/spacing/font-rendering noise
+  REGRESSION  - the model reads an element as changed/moved/disappeared
+  UNKNOWN     - the model is uncertain (we asked for this explicitly to avoid
                 forcing binary classification)
-  SKIPPED     - no OPENAI_API_KEY (only IDENTICAL/FIRST_RUN can be reported)
+  SKIPPED     - no AI provider configured (only IDENTICAL/FIRST_RUN reportable)
   ERROR       - request or parse failure
 
 Baselines are updated INTENTIONALLY by running:
@@ -33,16 +33,13 @@ import base64
 import hashlib
 import json
 import logging
-import os
 import shutil
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
-API_BASE = "https://api.openai.com/v1/chat/completions"
-REQUEST_TIMEOUT_S = 60
+MODULE = "ai_visual_diff"
 
 # baselines/ is at the REPO ROOT so it lives in version control alongside
 # the tests, not under reports/ (which is regenerated/cleaned). The user
@@ -53,9 +50,9 @@ BASELINE_ROOT = Path(__file__).resolve().parents[1] / "baselines"
 @dataclass
 class VisualDiffResult:
     status: str                       # FIRST_RUN | IDENTICAL | COSMETIC | REGRESSION | UNKNOWN | SKIPPED | ERROR
-    classification: str = ""          # same as status when GPT was consulted; empty otherwise
+    classification: str = ""          # same as status when the model was consulted; else empty
     confidence: float = 0.0           # 0.0 - 1.0
-    reasoning: str = ""               # GPT's explanation, or system message
+    reasoning: str = ""               # the model's explanation, or a system message
     baseline_path: str | None = None
     current_path: str | None = None
     bytes_equal: bool = False
@@ -83,73 +80,39 @@ def _encode_image(p: Path) -> str:
     return "data:image/png;base64," + base64.b64encode(p.read_bytes()).decode("ascii")
 
 
-def _gpt_classify(baseline: Path, current: Path, test_id: str) -> VisualDiffResult:
-    """Send both images to GPT, ask for COSMETIC | REGRESSION | UNKNOWN."""
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
+def _ai_classify(baseline: Path, current: Path, test_id: str) -> VisualDiffResult:
+    """Send both images to the model, ask for COSMETIC | REGRESSION | UNKNOWN.
+
+    Image ORDER matters — baseline first, current second. The prompt refers
+    to them positionally, and the provider preserves `image_paths` order.
+    """
+    from utils import ai_prompts
+    from utils.ai_parser import send_json
+    from utils.ai_provider import PROVIDER_NAME
+
+    if PROVIDER_NAME == "noop":
         return VisualDiffResult(
             status="SKIPPED",
             baseline_path=str(baseline), current_path=str(current),
-            reasoning="OPENAI_API_KEY not set; cannot run semantic diff.",
-        )
-    try:
-        import requests  # type: ignore
-    except ImportError:
-        return VisualDiffResult(
-            status="ERROR", error="ModuleNotFoundError: requests",
-            baseline_path=str(baseline), current_path=str(current),
+            reasoning="No AI provider configured; cannot run semantic diff.",
         )
 
-    prompt = (
-        f"You are reviewing a visual regression for test '{test_id}'.\n\n"
-        "I'll show you TWO screenshots of the same UI:\n"
-        "  Image 1 = BASELINE (the known-good reference)\n"
-        "  Image 2 = CURRENT  (today's run)\n\n"
-        "Classify the difference. Pick exactly one of:\n"
-        "  IDENTICAL   - no meaningful difference\n"
-        "  COSMETIC    - color, spacing, font-rendering, anti-aliasing — no\n"
-        "                element changed identity, position, or content\n"
-        "  REGRESSION  - an element changed identity / moved significantly /\n"
-        "                disappeared / appeared / content changed\n"
-        "  UNKNOWN     - you genuinely cannot tell (PREFER THIS over guessing)\n\n"
-        "Reply with a SINGLE JSON object, no other text, with keys:\n"
-        "  classification (one of the four above),\n"
-        "  confidence (float 0.0-1.0 — your certainty),\n"
-        "  reasoning (one sentence)."
+    parsed, resp = send_json(
+        ai_prompts.render("visual_diff", test_id=test_id),
+        module=MODULE,
+        image_paths=[baseline, current],
     )
-    payload = {
-        "model": DEFAULT_MODEL,
-        "response_format": {"type": "json_object"},
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": _encode_image(baseline)}},
-                {"type": "image_url", "image_url": {"url": _encode_image(current)}},
-            ],
-        }],
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    try:
-        resp = requests.post(API_BASE, json=payload, headers=headers,
-                             timeout=REQUEST_TIMEOUT_S)
-    except Exception as e:
+    if resp is not None and resp.error:
         return VisualDiffResult(
-            status="ERROR", error=str(e),
+            status="ERROR", error=resp.error,
             baseline_path=str(baseline), current_path=str(current),
+            reasoning=f"{resp.provider} error: {resp.error}",
         )
-    if resp.status_code != 200:
+    if not isinstance(parsed, dict):
         return VisualDiffResult(
-            status="ERROR",
-            error=f"HTTP {resp.status_code}: {resp.text[:300]}",
+            status="ERROR", error="ResponseParseError",
             baseline_path=str(baseline), current_path=str(current),
-        )
-    try:
-        parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
-    except (KeyError, ValueError, json.JSONDecodeError) as e:
-        return VisualDiffResult(
-            status="ERROR", error=str(e),
-            baseline_path=str(baseline), current_path=str(current),
+            reasoning="Could not parse model output as JSON.",
         )
 
     cls = str(parsed.get("classification", "UNKNOWN")).upper()
@@ -182,8 +145,8 @@ def diff_against_baseline(
 
     - If no baseline exists, returns FIRST_RUN. Caller can promote later
       with scripts/promote_baseline.py.
-    - If bytes identical, returns IDENTICAL with no GPT call (cheap).
-    - Otherwise calls GPT for semantic classification.
+    - If bytes identical, returns IDENTICAL with no AI call (cheap).
+    - Otherwise calls the model for semantic classification.
     """
     if not current_png.exists():
         return VisualDiffResult(
@@ -212,7 +175,7 @@ def diff_against_baseline(
                 reasoning="Byte-identical to baseline.",
             )
         else:
-            result = _gpt_classify(baseline, current_png, test_id)
+            result = _ai_classify(baseline, current_png, test_id)
             result.bytes_equal = False
 
     if output_verdict_path is not None:

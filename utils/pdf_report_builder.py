@@ -17,6 +17,7 @@ HTML fallback is always generated.
 
 from __future__ import annotations
 
+from html import escape as esc
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -196,11 +197,14 @@ def _render_report(
     <div class="score" style="color:{fw_color}">{scores.framework_health}</div>
     <div class="sub" style="color:{fw_color}">Framework Health</div>
   </div>
+  {_mobile_score_box(scores)}
 </div>
 <p style="font-size:10px;color:#64748b;margin-bottom:16px">
   Overall: <strong>{scores.overall}/100</strong>
-  &nbsp;(Product 50% · Infrastructure 30% · Framework 20% weighted average)
+  &nbsp;({_pdf_weighting_note(scores)})
 </p>
+
+{_mobile_section(scores)}
 
 <!-- Feature Coverage -->
 <h2>Feature Coverage</h2>
@@ -236,6 +240,168 @@ def _render_report(
 # ─────────────────────────────────────────────────────────────────────────────
 # Render helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _mobile_score_box(scores) -> str:
+    """Fourth score box. 'Not measured' is rendered explicitly — an absent box
+    would read as fine, a grey box reads as 'we did not look'."""
+    m = getattr(scores, "mobile_health", None)
+    quality = getattr(scores, "mobile_quality", None)
+    cov = getattr(scores, "mobile_coverage", None)
+    if m is None:
+        sub = ("Mobile (insufficient coverage)"
+               if quality is not None and cov is not None else "Mobile (not measured)")
+        return (
+            '<div class="score-box" style="background:#f1f5f9;'
+            'border:1px dashed #94a3b866">'
+            '<div class="score" style="color:#64748b">&mdash;</div>'
+            f'<div class="sub" style="color:#64748b">{sub}</div>'
+            "</div>"
+        )
+    _, color, bg = score_band(m)
+    sub = (f"Mobile — Q{quality} × {round(cov * 100)}%"
+           if quality is not None and cov is not None else "Mobile Health")
+    return (
+        f'<div class="score-box" style="background:{bg};border:1px solid {color}44">'
+        f'<div class="score" style="color:{color}">{m}</div>'
+        f'<div class="sub" style="color:{color}">{sub}</div>'
+        "</div>"
+    )
+
+
+def _pdf_weighting_note(scores) -> str:
+    v = getattr(scores, "scoring_version", 1)
+    if getattr(scores, "mobile_health", None) is None:
+        return (f"Product 50% · Infrastructure 30% · Framework 20% weighted "
+                f"average; scoring v{v}, Mobile excluded — no mobile tests ran")
+    return (f"Product 40% · Infrastructure 25% · Framework 20% · Mobile 15% "
+            f"weighted average; scoring v{v}")
+
+
+_SEV_ORDER = {"blocker": 0, "major": 1, "minor": 2, "info": 3}
+
+
+def _mobile_section(scores) -> str:
+    """Mobile compatibility for the EXPORT, including other engines.
+
+    Two parts, deliberately different in provenance:
+      * This session's findings — live, from the in-process accumulator.
+      * A cross-engine table read from each engine's persisted
+        mobile-summary.json sidecar. This is what puts a WebKit run's results
+        into a Chromium session's export (and vice versa) — without it, an
+        exported PDF silently carried only the exporting engine's mobile
+        story. Each row shows its own generated_at: these are point-in-time
+        snapshots of that engine's LAST mobile run, shown for reporting and
+        never scored.
+    """
+    from utils.mobile_report_builder import load_engine_summaries, session_findings
+
+    parts = ['<h2 class="page-break">Mobile Compatibility</h2>']
+
+    findings = sorted(
+        session_findings(),
+        key=lambda f: (_SEV_ORDER.get(f.get("severity", "info"), 9),
+                       f.get("page", ""), f.get("device", "")),
+    )
+    if findings:
+        shown = findings[:60]
+        rows = "".join(
+            "<tr>"
+            f"<td>{_sev_badge(str(f.get('severity', '')))}</td>"
+            f"<td style='white-space:nowrap'>{esc(str(f.get('engine', '') or '—'))}</td>"
+            f"<td style='white-space:nowrap'>{esc(str(f.get('page', '')))}</td>"
+            f"<td style='white-space:nowrap'>{esc(str(f.get('device', '')))}</td>"
+            f"<td style='white-space:nowrap'>{esc(str(f.get('category', '')))}</td>"
+            f"<td style='overflow-wrap:anywhere;line-height:1.45'>"
+            f"{esc(str(f.get('message', '')))}</td>"
+            "</tr>"
+            for f in shown
+        )
+        truncated = ("" if len(findings) <= 60 else
+                     f'<p style="font-size:9px;color:#94a3b8">…and '
+                     f'{len(findings) - 60} more (see dashboard).</p>')
+        parts.append(
+            f"<h3 style='font-size:11px;margin:8px 0 4px'>This session "
+            f"({len(findings)} finding{'s' if len(findings) != 1 else ''})</h3>"
+            "<table><thead><tr><th>Severity</th><th>Engine</th><th>Page</th>"
+            "<th>Device</th><th>Check</th><th>Finding</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table>{truncated}"
+        )
+    else:
+        parts.append(
+            '<p style="color:#94a3b8;font-size:10px">No mobile findings in '
+            "this session"
+            + (" — no mobile tests ran."
+               if getattr(scores, "mobile_health", None) is None
+               else " (mobile tests ran clean).") + "</p>"
+        )
+
+    # This session's AI triage, when it ran.
+    from utils.ai_mobile_triage import session_triage
+    t = session_triage()
+    if t:
+        inputs = t.get("input_groups", {})
+        trows = "".join(
+            "<tr>"
+            f"<td style='white-space:nowrap'>{esc(g['id'])}</td>"
+            f"<td style='white-space:nowrap'>{esc(str(inputs.get(g['id'], {}).get('severity', '?')))} · "
+            f"{esc(str(inputs.get(g['id'], {}).get('category', '?')))} "
+            f"×{inputs.get(g['id'], {}).get('count', '?')}</td>"
+            f"<td style='white-space:nowrap'>{esc(g['classification'])}</td>"
+            f"<td style='overflow-wrap:anywhere'>{esc(g.get('rationale', ''))}</td>"
+            "</tr>"
+            for g in t.get("groups", [])
+        )
+        parts.append(
+            "<h3 style='font-size:11px;margin:10px 0 4px'>AI triage "
+            "(advisory — model proposals validated against a closed set; "
+            "never affects scoring)</h3>"
+            + (f"<p style='font-size:10px;color:#475569'>{esc(t.get('summary', ''))}</p>"
+               if t.get("summary") else "")
+            + "<table><thead><tr><th>Group</th><th>What</th>"
+              "<th>Classification</th><th>Rationale</th></tr></thead>"
+              f"<tbody>{trows}</tbody></table>"
+        )
+
+    summaries = load_engine_summaries()
+    if summaries:
+        rows = ""
+        for sm in summaries:
+            sev = sm.get("by_severity", {})
+            untested = sum(
+                1 for f in sm.get("findings", [])
+                if "UNTESTED" in (f.get("message") or "")
+            )
+            rows += (
+                "<tr>"
+                f"<td style='white-space:nowrap'><strong>{esc(str(sm.get('engine', '?')))}</strong></td>"
+                f"<td style='white-space:nowrap'>{esc(str(sm.get('generated_at', '?'))[:19])}</td>"
+                f"<td>{sev.get('blocker', 0)}</td><td>{sev.get('major', 0)}</td>"
+                f"<td>{sev.get('minor', 0)}</td><td>{sev.get('info', 0)}</td>"
+                f"<td>{untested}</td>"
+                f"<td>{len(sm.get('devices_tested', []))}</td>"
+                "</tr>"
+            )
+        parts.append(
+            "<h3 style='font-size:11px;margin:10px 0 4px'>Latest result per "
+            "engine</h3>"
+            "<table><thead><tr><th>Engine</th><th>When (UTC)</th>"
+            "<th>Blocker</th><th>Major</th><th>Minor</th><th>Info</th>"
+            "<th>Untested</th><th>Devices</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table>"
+            '<p style="font-size:9px;color:#94a3b8">Each row is that '
+            "engine's most recent mobile run (point-in-time; reporting only, "
+            "never scored). UNTESTED counts checks the engine cannot "
+            "exercise — e.g. CDP touch gestures on WebKit — reported rather "
+            "than substituted.</p>"
+        )
+    else:
+        parts.append(
+            '<p style="color:#94a3b8;font-size:10px">No per-engine mobile '
+            "summaries recorded yet — run the mobile suite on each engine to "
+            "populate the cross-engine table.</p>"
+        )
+    return "\n".join(parts)
+
 
 def _card(label: str, value: str, color: str, bg: str) -> str:
     return (

@@ -5,6 +5,7 @@ No Java dependency — fully self-contained.
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import time
@@ -16,6 +17,11 @@ from utils.snapshot_writer import TestRecord
 from utils.risk_interpreter import interpret, ReleaseStatus
 import utils.health_tracker as _ht
 from utils.layered_health_scores import compute as _compute_layered, score_band
+from utils.mobile_report_builder import (
+    mobile_was_exercised as _mobile_ran,
+    session_findings as _mobile_findings,
+    session_check_stats as _mobile_check_stats,
+)
 from utils.error_clusterer import ErrorCluster
 
 logger = logging.getLogger(__name__)
@@ -46,13 +52,26 @@ def build(records: list[TestRecord], started_at_ms: int) -> Path:
     # Health score + layered domain scores
     health_score = _ht.compute_score(stats["total"], stats["passed"], stats["failed"])
     clusters     = _ht.get_clusters()
-    layered      = _compute_layered(records, clusters)
+    # Mobile findings must be passed HERE too, not only in conftest. build()
+    # computes its own layered scores, so omitting them would print
+    # "Mobile: not measured" on the dashboard while the session log reported a
+    # real Mobile score for the same run. check_stats must be resolved the
+    # same way conftest does it -- otherwise the trend-history entry appended
+    # below (from THIS score) records the undiscounted/ungated number while
+    # conftest logs the correct, coverage-gated one for the same run.
+    _cs = _mobile_check_stats()
+    _engine_cs = next(iter(_cs.values()), None) if _cs else None
+    layered      = _compute_layered(records, clusters,
+                                    mobile_findings=_mobile_findings(),
+                                    mobile_tested=_mobile_ran(),
+                                    check_stats=_engine_cs)
 
-    _append_trend(stats, decision, started_at_ms)
+    _append_trend(stats, decision, started_at_ms, layered)
     trend = _load_trend()
 
     html = _render(records, stats, decision, trend, started_at_ms,
-                   health_score=health_score, layered=layered, clusters=clusters)
+                   health_score=health_score, layered=layered, clusters=clusters,
+                   mobile_findings=_mobile_findings())
     DASHBOARD_PATH.parent.mkdir(parents=True, exist_ok=True)
     DASHBOARD_PATH.write_text(html, encoding="utf-8")
     logger.info("[DashboardBuilder] Written → %s", DASHBOARD_PATH)
@@ -92,7 +111,16 @@ def _compute_stats(records: list[TestRecord]) -> dict[str, Any]:
 # Trend persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _append_trend(stats: dict, decision: Any, started_at_ms: int) -> None:
+def _append_trend(stats: dict, decision: Any, started_at_ms: int,
+                  scores: Any = None) -> None:
+    """Append one run to the rolling 30-run history.
+
+    Records `overall` and `scoring_version` from this run onward. Neither was
+    persisted before -- which is why adding Mobile to the formula needed no
+    backfill, but also meant a future formula change would be undetectable.
+    Entries lacking `scoring_version` predate v2; do not plot them on the same
+    axis as versioned ones.
+    """
     history: list[dict] = []
     if TREND_JSON.exists():
         try:
@@ -109,6 +137,10 @@ def _append_trend(stats: dict, decision: Any, started_at_ms: int) -> None:
         "failed":    stats["failed"],
         "pass_rate": stats["pass_rate"],
         "status":    decision.status.value,
+        # Absent on entries written before scoring was versioned.
+        **({"overall": scores.overall,
+            "mobile": scores.mobile_health,
+            "scoring_version": scores.scoring_version} if scores is not None else {}),
     })
 
     # Keep last 30 runs
@@ -1577,30 +1609,49 @@ def _render(
     *,
     health_score: int = 0,
     layered: Any = None,
+    mobile_findings: list[dict] | None = None,
     clusters: list[ErrorCluster] | None = None,
 ) -> str:
     run_time  = datetime.fromtimestamp(started_at_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # AI executive summary — falls back to a deterministic plain-language
-    # summary when OPENAI_API_KEY is unset. Numeric metrics are computed
-    # in Python and rendered separately; GPT only narrates.
+    # Executive summary — DETERMINISTIC, composed from the run's real numbers
+    # (see utils/ai_exec_summary). It is fed the mobile finding/coverage-gap
+    # context so it cannot claim "all requirements met / recommended for
+    # release" off the pytest pass count while blind to product findings.
     exec_html = ""
     try:
-        from utils.ai_exec_summary import summarize as _ai_summarize
-        ai_summary = _ai_summarize(stats, records, decision.status.value)
+        from utils.ai_exec_summary import summarize as _exec_summarize
+        _mf = _mobile_findings()
+        _mobile_ctx = None
+        if _mf:
+            from utils.ai_mobile_triage import group_findings
+            _actionable = sum(
+                1 for x in _mf
+                if (x.get("severity") or "").lower() in ("blocker", "major", "minor"))
+            _gaps = sum(
+                1 for x in _mf
+                if "UNTESTED" in (x.get("message") or "")
+                or "UNSUPPORTED" in (x.get("message") or ""))
+            _mobile_ctx = {
+                "findings": _actionable,
+                "patterns": len(group_findings(_mf)),
+                "coverage_gaps": _gaps,
+            }
+        exec_summary = _exec_summarize(
+            stats, records, decision.status.value, mobile=_mobile_ctx)
     except Exception as e:
         logger.warning("Exec summary failed (non-fatal): %s", e)
-        ai_summary = ""
-    if ai_summary:
+        exec_summary = ""
+    if exec_summary:
         exec_html = (
-            "<div style='background:#f8fafc;border-left:4px solid #0ea5e9;"
+            "<div class='tint-surface' style='background:#f8fafc;border-left:4px solid #0ea5e9;"
             "padding:14px 18px;margin-bottom:18px;border-radius:6px;'>"
             "<div style='font-size:10px;font-weight:700;color:#0284c7;"
             "text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;'>"
-            "🤖 AI Executive Summary"
+            "Executive Summary"
             "</div>"
-            f"<div style='font-size:13px;color:#1e293b;line-height:1.5;'>{ai_summary}</div>"
+            f"<div style='font-size:13px;color:#1e293b;line-height:1.5;'>{exec_summary}</div>"
             "</div>"
         )
 
@@ -1609,7 +1660,7 @@ def _render(
     if decision.status != ReleaseStatus.READY:
         first_fail = next((r.method for r in records if r.status == "FAIL"), "—")
         triage_html = f"""
-        <div style="background:{decision.bg};border:2px solid {decision.color}33;border-radius:12px;
+        <div class="tint-surface" style="background:{decision.bg};border:2px solid {decision.color}33;border-radius:12px;
                     padding:20px 24px;margin-bottom:24px">
           <div style="font-size:11px;font-weight:700;color:{decision.color};
                       text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">
@@ -1659,6 +1710,7 @@ def _render(
     feature_rows = _render_feature_rows(stats["by_feature"])
     trend_rows   = _render_trend_rows(trend)
     health_html  = _render_health_section(health_score, layered) if layered else ""
+    mobile_html  = _render_mobile_section(mobile_findings or [], layered)
     cluster_html = _render_cluster_section(clusters or [])
     login_routes_html = _render_login_routes_section()
     browser_tabs_html = _render_browser_tabs()
@@ -1726,6 +1778,53 @@ def _render(
   body.dark select, body.dark input, body.dark button.theme-aware {{
     background: #0f172a !important; color: #e2e8f0 !important; border-color: #334155 !important; }}
 
+  /* ── Dark mode: large tinted surfaces ──────────────────────────────
+     The stat cards, health cells, exec-summary panel and decision pills
+     set a pale tint (#eef2ff / #dcfce7 / #f8fafc / score_band bg) as an
+     INLINE style, so it beats any plain CSS rule. Left alone in dark mode
+     you get a near-white panel whose text has been lightened by the rules
+     above — i.e. invisible. Swap the surface, keep the accent border.     */
+  body.dark .tint-surface {{
+    background: #172135 !important;
+    border-color: #334155 !important; }}
+  /* The exec-summary panel's left accent bar should stay coloured. */
+  body.dark .tint-surface[style*="border-left"] {{
+    border-left-color: #0ea5e9 !important; }}
+
+  /* ── Dark mode: accent-colour contrast lift ────────────────────────
+     These hexes are chosen for contrast against a PALE tint, so on #172135
+     the darkest of them (#14532d, #92400e) are effectively invisible. Each
+     is mapped to the same hue several steps lighter, preserving the colour
+     coding rather than flattening everything to one neutral.
+
+     SOURCE OF TRUTH — these values are not invented here:
+       utils/layered_health_scores.score_band()  → the 5 band colours
+       utils/risk_interpreter                    → the decision colours
+     If a colour is added or changed there, add the matching row here or it
+     will silently render unreadable in dark mode.
+     The [style*=...] idiom matches the neutral-text rules above, and is
+     needed because these colours are applied inline.                       */
+  /* score_band(): EXCELLENT / HEALTHY / FAIR / POOR / CRITICAL */
+  body.dark [style*="color:#14532d"] {{ color: #4ade80 !important; }}
+  body.dark [style*="color:#166534"] {{ color: #4ade80 !important; }}
+  body.dark [style*="color:#713f12"] {{ color: #fbbf24 !important; }}
+  body.dark [style*="color:#9a3412"] {{ color: #fb923c !important; }}
+  /* risk_interpreter decision colours */
+  body.dark [style*="color:#92400e"] {{ color: #fbbf24 !important; }}
+  body.dark [style*="color:#ca8a04"] {{ color: #facc15 !important; }}
+  body.dark [style*="color:#ea580c"] {{ color: #fb923c !important; }}
+  body.dark [style*="color:#16a34a"] {{ color: #4ade80 !important; }}
+  body.dark [style*="color:#dc2626"] {{ color: #f87171 !important; }}
+  /* Section accents used across the cards */
+  body.dark [style*="color:#0369a1"] {{ color: #38bdf8 !important; }}  /* pass-rate blue */
+  body.dark [style*="color:#0284c7"] {{ color: #38bdf8 !important; }}  /* exec-summary label */
+  body.dark [style*="color:#6366f1"] {{ color: #a5b4fc !important; }}  /* total indigo */
+  body.dark [style*="color:#7c3aed"] {{ color: #c4b5fd !important; }}  /* PRODUCT domain */
+  body.dark [style*="color:#b45309"] {{ color: #fbbf24 !important; }}  /* FRAMEWORK / medium */
+  /* Small pale-tinted BADGES are deliberately left alone — a light chip on a
+     dark page reads as intended, and re-theming them flattens the severity
+     colour coding that makes the tables scannable. */
+
   /* ────────────────────────────────────────────────────────────────
      Print / PDF export rules — triggered by the "🖨️ Export PDF"
      button (which calls window.print()). The user picks "Save as PDF"
@@ -1770,7 +1869,7 @@ def _render(
       </div>
     </div>
     <div style="text-align:right">
-      <div style="display:inline-block;padding:8px 18px;border-radius:8px;
+      <div class="tint-surface" style="display:inline-block;padding:8px 18px;border-radius:8px;
                   background:{decision.bg};border:2px solid {decision.color}55">
         <span style="font-size:18px;font-weight:800;color:{decision.color}">{decision.label}</span>
       </div>
@@ -1789,7 +1888,7 @@ def _render(
           <input type="checkbox" id="auto-reload-toggle" onchange="toggleAutoReload()">
           🔄 Auto-refresh
         </label>
-        <button onclick="window.print()"
+        <button onclick="window.print()" class="theme-aware"
                 style="font-size:12px;font-weight:600;padding:8px 16px;
                        border-radius:6px;border:1px solid #cbd5e1;
                        background:#fff;color:#0f172a;cursor:pointer;"
@@ -1821,6 +1920,7 @@ def _render(
 
   <!-- Health Score + Layered Scores -->
   {health_html}
+  {mobile_html}
 
   <!-- JS Error Clusters -->
   {cluster_html}
@@ -1848,7 +1948,7 @@ def _render(
 
   <!-- All test results -->
   <div class="card">
-    <h2>Test Results ({stats["total"]} tests · {_fmt_ms(stats["total_ms"])} total)</h2>
+    <h2>Test Results ({stats["total"]} regression tests · {_fmt_ms(stats["total_ms"])} total)</h2>
     {toolbar_html}
     <table id="test-results-table">
       <thead><tr>
@@ -1889,8 +1989,11 @@ def _render(
 
 
 def _summary_card(label: str, value: str, color: str, bg: str) -> str:
+    # `tint-surface` marks a large pale-tinted panel. The tint is an inline
+    # style (so it wins over CSS), which is why dark mode needs a class hook
+    # with !important to swap it — see the `body.dark .tint-surface` rule.
     return (
-        f"<div style='background:{bg};border-radius:10px;padding:16px 20px'>"
+        f"<div class='tint-surface' style='background:{bg};border-radius:10px;padding:16px 20px'>"
         f"<div style='font-size:11px;font-weight:700;color:{color};text-transform:uppercase;"
         f"letter-spacing:0.8px;margin-bottom:6px'>{label}</div>"
         f"<div style='font-size:28px;font-weight:800;color:{color}'>{value}</div>"
@@ -1902,13 +2005,73 @@ def _summary_card(label: str, value: str, color: str, bg: str) -> str:
 # Health score section
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _mobile_cell(layered: Any) -> str:
+    """The Mobile domain cell.
+
+    When mobile was not exercised this renders an explicit "not measured"
+    tile rather than being omitted. A missing tile reads as "fine"; a grey
+    NOT MEASURED tile reads as "we did not look", which is the truth.
+    """
+    score = getattr(layered, "mobile_health", None)
+    quality = getattr(layered, "mobile_quality", None)
+    cov = getattr(layered, "mobile_coverage", None)
+    if score is None:
+        # Insufficient coverage (quality computed but too little ran) vs never ran.
+        if quality is not None and cov is not None:
+            note = f"INSUFFICIENT COVERAGE ({round(cov * 100)}% executed)"
+        else:
+            note = "NOT MEASURED"
+        return (
+            "<div class='tint-surface' style='text-align:center;background:#f1f5f9;"
+            "border-radius:8px;padding:14px 10px;border:1px dashed #94a3b855'>"
+            "<div style='font-size:22px;font-weight:800;color:#64748b'>&mdash;</div>"
+            "<div style='font-size:9px;font-weight:700;text-transform:uppercase;"
+            "letter-spacing:0.6px;color:#64748b;margin-top:4px'>Mobile</div>"
+            f"<div style='font-size:9px;color:#94a3b8;margin-top:2px'>{note}</div>"
+            "</div>"
+        )
+    band_label, color, bg = score_band(score)
+    counts = (
+        f"{getattr(layered, 'mobile_blocker', 0)}B / "
+        f"{getattr(layered, 'mobile_major', 0)}Maj / "
+        f"{getattr(layered, 'mobile_minor', 0)}Min"
+    )
+    breakdown = (f"Quality {quality} × {round(cov * 100)}% coverage"
+                 if quality is not None and cov is not None else counts)
+    return (
+        f"<div class='tint-surface' style='text-align:center;background:{bg};"
+        f"border-radius:8px;padding:14px 10px;border:1px solid {color}33'>"
+        f"<div style='font-size:30px;font-weight:800;color:{color}'>{score}</div>"
+        f"<div style='font-size:9px;font-weight:700;text-transform:uppercase;"
+        f"letter-spacing:0.6px;color:{color};margin-top:4px'>Mobile</div>"
+        f"<div style='font-size:9px;color:#94a3b8;margin-top:2px'>{counts}</div>"
+        f"<div style='font-size:9px;color:#94a3b8;margin-top:1px'>{breakdown}</div>"
+        f"</div>"
+    )
+
+
+def _weighting_note(layered: Any) -> str:
+    """Spell out the active weighting — it changes with mobile presence."""
+    v = getattr(layered, "scoring_version", 1)
+    if getattr(layered, "mobile_health", None) is None:
+        return (
+            f"Product 50% · Infrastructure 30% · Framework 20% weighted average "
+            f"&rarr; Overall {layered.overall}/100 &nbsp;·&nbsp; scoring v{v}, "
+            f"Mobile excluded (no mobile tests in this run)"
+        )
+    return (
+        f"Product 40% · Infrastructure 25% · Framework 20% · Mobile 15% weighted "
+        f"average &rarr; Overall {layered.overall}/100 &nbsp;·&nbsp; scoring v{v}"
+    )
+
+
 def _render_health_section(health_score: int, layered: Any) -> str:
     """Render the 0-100 health score + layered domain scores card."""
 
     def _score_cell(label: str, score: int) -> str:
         band_label, color, bg = score_band(score)
         return (
-            f"<div style='text-align:center;background:{bg};border-radius:8px;"
+            f"<div class='tint-surface' style='text-align:center;background:{bg};border-radius:8px;"
             f"padding:14px 10px;border:1px solid {color}33'>"
             f"<div style='font-size:30px;font-weight:800;color:{color}'>{score}</div>"
             f"<div style='font-size:9px;font-weight:700;text-transform:uppercase;"
@@ -1917,29 +2080,434 @@ def _render_health_section(health_score: int, layered: Any) -> str:
             f"</div>"
         )
 
-    overall_label, overall_color, overall_bg = score_band(health_score)
+    # ONE number on the card. The badge used to show the legacy health_tracker
+    # score (raw pass rate − JS-cluster penalties) while the footnote showed
+    # the layered weighted overall — the 2026-08-19 full run rendered "69/100"
+    # in the badge and "→ Overall 79/100" in the footnote of the SAME card.
+    # Two scoring systems disagreeing on the primary surface is worse than
+    # either alone. The layered overall is authoritative (it is what the trend
+    # persists and what excludes harness faults); the legacy figure stays
+    # visible but explicitly labelled.
+    badge_score = layered.overall if layered is not None else health_score
+    overall_label, overall_color, overall_bg = score_band(badge_score)
 
     return f"""
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
         <h2 style="margin:0">Health Score</h2>
-        <div style="background:{overall_bg};border:2px solid {overall_color}55;border-radius:8px;
+        <div class="tint-surface" style="background:{overall_bg};border:2px solid {overall_color}55;border-radius:8px;
                     padding:6px 16px;font-size:22px;font-weight:800;color:{overall_color}">
-          {health_score}<span style="font-size:13px;font-weight:500;color:#94a3b8">/100</span>
+          {badge_score}<span style="font-size:13px;font-weight:500;color:#94a3b8">/100</span>
         </div>
       </div>
       <p style="font-size:11px;color:#64748b;margin-bottom:14px">
-        Overall: <strong>{overall_label}</strong> &nbsp;·&nbsp;
-        Base = pass rate; penalties: CRITICAL cluster −5 pts (cap −20), HIGH cluster −2 pts (cap −10).
+        Overall: <strong>{overall_label}</strong> (weighted domain average, scoring
+        v{getattr(layered, "scoring_version", 1)}; infrastructure/harness failures
+        excluded from Product) &nbsp;·&nbsp; legacy pass-rate score:
+        {health_score}/100 (counts every failure, incl. connectivity).
       </p>
-      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px">
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">
         {_score_cell("Product Health", layered.product_health)}
         {_score_cell("Infra Health", layered.infra_health)}
         {_score_cell("Framework Health", layered.framework_health)}
+        {_mobile_cell(layered)}
       </div>
       <p style="font-size:10px;color:#94a3b8;margin-top:10px">
-        Product 50% · Infrastructure 30% · Framework 20% weighted average → Overall {layered.overall}/100
+        {_weighting_note(layered)}
       </p>
+    </div>
+    """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mobile findings section
+#
+# This replaces the standalone reports/mobile/*.html report. One surface, not
+# two: a separate report is a second place to forget to look, and it drifted
+# out of sync the moment a run overwrote it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MOBILE_SEV_STYLE = {
+    "blocker": ("#dc2626", "#fee2e2"),
+    "major":   ("#ea580c", "#ffedd5"),
+    "minor":   ("#ca8a04", "#fef9c3"),
+    "info":    ("#0284c7", "#e0f2fe"),
+}
+
+
+_AI_CLS_STYLE = {
+    "PRODUCT_DEFECT":        ("#dc2626", "#fee2e2"),
+    "AUDITOR_ARTIFACT":      ("#7c3aed", "#ede9fe"),
+    "RESPONSIVE_BY_DESIGN":  ("#16a34a", "#dcfce7"),
+    "NEEDS_HUMAN":           ("#64748b", "#f1f5f9"),
+}
+
+
+def _render_mobile_ai_triage(total_groups: int | None = None) -> str:
+    """The AI classification block. AI proposals only — severity, scoring and
+    pass/fail stay deterministic. Absence is stated, never implied: when
+    triage did not run the block says so and points at the session log —
+    including how many pattern groups therefore went unanalysed, so a reader
+    can never mistake a failed analysis for a complete one."""
+    from utils.ai_mobile_triage import session_triage
+    t = session_triage()
+    if not t:
+        pending = (
+            f" {total_groups} pattern group(s) awaited analysis; "
+            f"<strong>0 were analysed</strong>."
+            if total_groups else ""
+        )
+        return (
+            '<p style="font-size:10px;color:#94a3b8;margin:6px 0">'
+            "AI analysis unavailable (no provider configured, or the analysis "
+            f"failed — see the session log).{pending} Classifications would be "
+            "advisory only; scoring is deterministic either way.</p>"
+        )
+    inputs = t.get("input_groups", {})
+    # Coverage line: prefer the counts the triage stored; fall back to
+    # counting the budget-excluded padding rows for older results.
+    total = t.get("total_count") or len(t.get("groups", []))
+    analysed = t.get("analysed_count")
+    if analysed is None:
+        analysed = sum(
+            1 for g in t.get("groups", [])
+            if g.get("rationale") != "not analysed — payload budget reached"
+        )
+    cov_color = "#16a34a" if analysed == total else "#d97706"
+    coverage = (
+        f" <span style='color:{cov_color};font-weight:700'>"
+        f"AI analysed {analysed} of {total} pattern group(s).</span>"
+        + ("" if analysed == total else
+           " The remainder are marked NEEDS_HUMAN, not silently dropped.")
+    )
+    rows = []
+    td = ("padding:6px 10px;border-bottom:1px solid #e2e8f033;font-size:11px;"
+          "vertical-align:top")
+    for g in t.get("groups", []):
+        color, bg = _AI_CLS_STYLE.get(g["classification"], ("#64748b", "#f1f5f9"))
+        src = inputs.get(g["id"], {})
+        label = (f"{src.get('severity', '?')} · {src.get('category', '?')} "
+                 f"×{src.get('count', '?')}")
+        conf = f" ({int(g['confidence'] * 100)}%)" if g.get("confidence") is not None else ""
+        rows.append(
+            "<tr>"
+            f"<td style='{td};white-space:nowrap'>{html.escape(g['id'])}</td>"
+            f"<td style='{td};white-space:nowrap'>{html.escape(label)}</td>"
+            f"<td style='{td};white-space:nowrap'><span style='background:{bg};"
+            f"color:{color};border-radius:999px;padding:1px 8px;font-size:10px;"
+            f"font-weight:700'>{html.escape(g['classification'])}{conf}</span></td>"
+            f"<td style='{td};overflow-wrap:anywhere'>{html.escape(g.get('rationale', ''))}"
+            + (f" <em style='color:#94a3b8'>Fix: {html.escape(g['suggested_fix'])}</em>"
+               if g.get("suggested_fix") else "")
+            + "</td></tr>"
+        )
+    summary = html.escape(t.get("summary", ""))
+    return (
+        "<div style='margin:8px 0'>"
+        "<p style='font-size:11px;color:#64748b;margin:0 0 4px'>"
+        "<strong>AI triage</strong> (advisory — proposals from the model, "
+        "validated against a closed set in code; never affects scoring)."
+        + coverage
+        + (f" Summary: <em>{summary}</em>" if summary else "") + "</p>"
+        "<div style='overflow-x:auto'><table style='width:100%;"
+        "border-collapse:collapse'><thead><tr>"
+        "<th style='text-align:left;font-size:10px;padding:6px 10px'>Group</th>"
+        "<th style='text-align:left;font-size:10px;padding:6px 10px'>What</th>"
+        "<th style='text-align:left;font-size:10px;padding:6px 10px'>Classification</th>"
+        "<th style='text-align:left;font-size:10px;padding:6px 10px'>Rationale</th>"
+        f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div></div>"
+    )
+
+
+def _render_mobile_section(findings: list[dict], layered: Any = None) -> str:
+    """Mobile findings, grouped by severity, most serious first.
+
+    `info` findings are shown too, and deliberately so: they carry the
+    "this check could not run on this engine" notices. Hiding them would let a
+    green panel imply touch coverage that WebKit cannot actually provide.
+    """
+    if not findings:
+        if layered is not None and getattr(layered, "mobile_health", None) is None:
+            return (
+                '<div class="card"><h2>Mobile</h2>'
+                '<p style="font-size:11px;color:#64748b">No mobile tests ran in '
+                'this session, so mobile behaviour was <strong>not measured</strong>. '
+                'Run <code>pytest -m mobile</code> to populate this section.</p></div>'
+            )
+        return (
+            '<div class="card"><h2>Mobile</h2>'
+            '<p style="font-size:11px;color:#16a34a">Mobile tests ran and raised '
+            'no findings.</p></div>'
+        )
+
+    order = ("blocker", "major", "minor", "info")
+    by_sev: dict[str, list[dict]] = {k: [] for k in order}
+    for f in findings:
+        by_sev.setdefault(f.get("severity", "info"), []).append(f)
+
+    engines = sorted({(f.get("details") or {}).get("engine")
+                      for f in findings if (f.get("details") or {}).get("engine")})
+
+    # One grouping mechanism everywhere: the same device-blind, number-blind
+    # collapse the AI triage uses, so the G-ids in the pattern table below
+    # match the G-ids in the AI triage table. 247 per-device findings are
+    # ~36-86 unique patterns — the pattern is the unit a developer acts on;
+    # the per-device rows are its evidence.
+    from utils.ai_mobile_triage import group_findings
+    groups = group_findings(findings)
+    actionable = sum(1 for f in findings
+                     if (f.get("severity") or "").lower()
+                     in ("blocker", "major", "minor"))
+    all_devices = sorted({f.get("device") for f in findings if f.get("device")})
+    n_dev = len(all_devices)
+
+    chips = []
+    for sev in order:
+        n = len(by_sev.get(sev) or [])
+        if not n:
+            continue
+        color, bg = _MOBILE_SEV_STYLE[sev]
+        chips.append(
+            f"<span class='tint-surface' style='background:{bg};color:{color};"
+            f"border:1px solid {color}33;border-radius:999px;padding:2px 10px;"
+            f"font-size:10px;font-weight:700;text-transform:uppercase'>"
+            f"{n} {sev}</span>"
+        )
+    if groups:
+        chips.append(
+            "<span class='tint-surface' style='background:#f1f5f9;color:#334155;"
+            "border:1px solid #33415533;border-radius:999px;padding:2px 10px;"
+            "font-size:10px;font-weight:700'>"
+            f"{actionable} findings → {len(groups)} unique patterns</span>"
+        )
+
+    rows = []
+    for sev in order:
+        for f in sorted(by_sev.get(sev) or [], key=lambda x: (x.get("page", ""), x.get("device", ""))):
+            color, bg = _MOBILE_SEV_STYLE.get(sev, ("#64748b", "#f1f5f9"))
+            det = f.get("details") or {}
+            extra = ""
+            if "drift_px" in det:
+                extra = f" <em style='color:#94a3b8'>(drift {det['drift_px']}px)</em>"
+            # Real cell spacing, not just a font-size: without padding the
+            # rows render cramped and long finding messages collide with the
+            # neighbouring column. Fixed columns get nowrap; the message
+            # column wraps and word-breaks so a long URL cannot widen the
+            # table past its overflow-x container.
+            td_fixed = ("padding:6px 10px;border-bottom:1px solid #e2e8f033;"
+                        "font-size:11px;vertical-align:top;white-space:nowrap")
+            td_msg = ("padding:6px 10px;border-bottom:1px solid #e2e8f033;"
+                      "font-size:11px;vertical-align:top;line-height:1.45;"
+                      "overflow-wrap:anywhere;min-width:280px")
+            rows.append(
+                "<tr>"
+                f"<td style='{td_fixed}'><span style='color:{color};"
+                f"font-weight:700;font-size:10px;text-transform:uppercase'>"
+                f"{html.escape(sev)}</span></td>"
+                f"<td style='{td_fixed}'>{html.escape(str(f.get('engine', '') or '—'))}</td>"
+                f"<td style='{td_fixed}'>{html.escape(str(f.get('page', '')))}</td>"
+                f"<td style='{td_fixed}'>{html.escape(str(f.get('device', '')))}</td>"
+                f"<td style='{td_fixed}'>{html.escape(str(f.get('category', '')))}</td>"
+                f"<td style='{td_msg}'>{html.escape(str(f.get('message', '')))}{extra}</td>"
+                "</tr>"
+            )
+
+    # ── Pattern table: one row per unique issue, most serious first ────
+    th = ("text-align:left;font-size:10px;padding:6px 10px;"
+          "border-bottom:2px solid #e2e8f0")
+    td_p = ("padding:6px 10px;border-bottom:1px solid #e2e8f033;font-size:11px;"
+            "vertical-align:top")
+    pattern_rows = []
+    for g in groups:
+        color, bg = _MOBILE_SEV_STYLE.get(g["severity"], ("#64748b", "#f1f5f9"))
+        nd = len(g["devices"])
+        if n_dev > 1 and nd == n_dev:
+            reach, reach_color = "cross-device", "#dc2626"
+        elif nd == 1:
+            reach, reach_color = "device-specific", "#0284c7"
+        else:
+            reach, reach_color = "partial", "#d97706"
+        sample = (g["samples"][0] if g.get("samples") else g.get("pattern", ""))
+        pattern_rows.append(
+            "<tr>"
+            f"<td style='{td_p};white-space:nowrap'>{html.escape(g['id'])}</td>"
+            f"<td style='{td_p};white-space:nowrap'><span style='color:{color};"
+            f"font-weight:700;font-size:10px;text-transform:uppercase'>"
+            f"{html.escape(g['severity'])}</span></td>"
+            f"<td style='{td_p};white-space:nowrap'>{html.escape(g['category'])}</td>"
+            f"<td style='{td_p};overflow-wrap:anywhere;min-width:260px;"
+            f"line-height:1.45'>{html.escape(sample)}</td>"
+            f"<td style='{td_p}'>{html.escape(', '.join(g['pages']))}</td>"
+            f"<td style='{td_p};white-space:nowrap'>{nd}/{n_dev} "
+            f"<span style='color:{reach_color};font-size:10px;font-weight:700'>"
+            f"{reach}</span></td>"
+            f"<td style='{td_p};text-align:right'>{g['count']}</td>"
+            "</tr>"
+        )
+    pattern_html = ""
+    if pattern_rows:
+        pattern_html = (
+            "<p style='font-size:11px;color:#64748b;margin:8px 0 4px'>"
+            "<strong>Unique issue patterns</strong> — one row per distinct "
+            "issue; Count is how many per-device/per-page findings it "
+            "produced. G-ids match the AI triage table.</p>"
+            "<div style='overflow-x:auto'><table style='width:100%;"
+            "border-collapse:collapse'><thead><tr>"
+            f"<th style='{th}'>ID</th><th style='{th}'>Severity</th>"
+            f"<th style='{th}'>Check</th><th style='{th}'>Example finding</th>"
+            f"<th style='{th}'>Pages</th><th style='{th}'>Devices</th>"
+            f"<th style='{th};text-align:right'>Count</th>"
+            f"</tr></thead><tbody>{''.join(pattern_rows)}</tbody></table></div>"
+        )
+
+    # ── Coverage gaps: aggregated, never buried in the raw table ───────
+    # UNTESTED/UNSUPPORTED notes are a statement about what this engine
+    # could not exercise. As 78 identical rows they vanish; as one row per
+    # check they read as what they are: a coverage gap, not a pass.
+    gaps: dict[str, dict] = {}
+    for f in findings:
+        msg = f.get("message") or ""
+        if "UNTESTED" in msg or "UNSUPPORTED" in msg:
+            g = gaps.setdefault(f.get("category") or "?",
+                                {"count": 0, "pages": set(), "sample": msg})
+            g["count"] += 1
+            g["pages"].add(f.get("page") or "?")
+    untested_note = ""
+    if gaps:
+        gap_rows = "".join(
+            "<tr>"
+            f"<td style='{td_p};white-space:nowrap'>{html.escape(check)}</td>"
+            f"<td style='{td_p}'>{html.escape(', '.join(sorted(g['pages'])))}</td>"
+            f"<td style='{td_p};text-align:right'>{g['count']}</td>"
+            f"<td style='{td_p};overflow-wrap:anywhere;min-width:260px;"
+            f"line-height:1.45'>{html.escape(g['sample'][:200])}</td>"
+            "</tr>"
+            for check, g in sorted(gaps.items())
+        )
+        total_gap = sum(g["count"] for g in gaps.values())
+        untested_note = (
+            f"<p style='font-size:11px;color:#0284c7;margin:8px 0 4px'>"
+            f"<strong>Coverage gaps on this engine: {len(gaps)} check "
+            f"famil{'y' if len(gaps) == 1 else 'ies'} not exercised "
+            f"({total_gap} notice(s))</strong> — UNTESTED means untested, "
+            f"not passed. Nothing was substituted with a mouse event.</p>"
+            "<div style='overflow-x:auto'><table style='width:100%;"
+            "border-collapse:collapse'><thead><tr>"
+            f"<th style='{th}'>Check</th><th style='{th}'>Pages</th>"
+            f"<th style='{th};text-align:right'>Notices</th>"
+            f"<th style='{th}'>Why</th>"
+            f"</tr></thead><tbody>{gap_rows}</tbody></table></div>"
+        )
+
+    # ── The three-questions strip. One number cannot answer "how many
+    # observations were made", "how many distinct issues is that", and "how
+    # much of the framework actually executed" — so each gets its own tile,
+    # and the health score can never be misread as any of them.
+    total_gap = sum(g["count"] for g in gaps.values()) if gaps else 0
+    sev_counts = {s: len(by_sev.get(s) or []) for s in order}
+
+    def _tile(n, label, color="#334155"):
+        return (
+            "<div style='min-width:92px;padding:8px 12px;border:1px solid "
+            "#e2e8f0;border-radius:10px;text-align:center'>"
+            f"<div style='font-size:18px;font-weight:800;color:{color}'>{n}</div>"
+            f"<div style='font-size:9px;color:#64748b;text-transform:uppercase;"
+            f"letter-spacing:.5px'>{label}</div></div>"
+        )
+
+    strip_tiles = [
+        _tile(len(findings), "Findings"),
+        _tile(len(groups), "Unique patterns"),
+        _tile(total_gap, "Coverage gaps", "#0284c7"),
+        _tile(sev_counts.get("blocker", 0), "Blocker", _MOBILE_SEV_STYLE["blocker"][0]),
+        _tile(sev_counts.get("major", 0), "Major", _MOBILE_SEV_STYLE["major"][0]),
+        _tile(sev_counts.get("minor", 0), "Minor", _MOBILE_SEV_STYLE["minor"][0]),
+    ]
+
+    # Executed coverage per engine, from the sidecars (each engine's last
+    # run). Derived from the auditor's attempt tally, NOT from findings — a
+    # check that runs clean emits nothing, so findings under-count execution.
+    # Two coverage figures, because a reviewer must not have to reconcile
+    # "67% executed" against "Quality × 100% coverage" themselves:
+    #   raw execution  = executed / attempted            (all invocations)
+    #   scoring coverage = executed / (attempted − N/A)   (drops structurally
+    #                      unsupported checks; THIS is what multiplies Quality)
+    coverage_lines = []
+    try:
+        from utils.mobile_report_builder import load_engine_summaries
+        for s in load_engine_summaries():
+            cs = s.get("check_stats") or {}
+            att = int(cs.get("attempted") or 0)
+            exe = int(cs.get("executed") or 0)
+            na  = int(cs.get("na_structural") or 0)
+            if att:
+                executable = att - na
+                raw_pct = round(100 * exe / att)
+                scor_pct = round(100 * exe / executable) if executable > 0 else 0
+                eng = html.escape(str(s.get("engine", "?")))
+                coverage_lines.append(
+                    f"<strong>{eng}</strong> "
+                    f"{raw_pct}% raw execution ({exe}/{att}) &nbsp;·&nbsp; "
+                    f"{scor_pct}% scoring coverage ({exe}/{executable}"
+                    + (f", {na} N/A — structurally unsupported" if na else "")
+                    + ")"
+                )
+    except Exception:
+        pass
+    coverage_html = (
+        "<p style='font-size:11px;color:#64748b;margin:2px 0 8px'>Coverage — "
+        + " &nbsp;|&nbsp; ".join(coverage_lines)
+        + ". <strong>Raw execution</strong> is the share of all interaction-check "
+          "invocations that ran; <strong>scoring coverage</strong> excludes checks "
+          "the engine structurally cannot run (N/A — e.g. WebKit lacks the "
+          "Chromium CDP gesture/network APIs) and is the figure multiplied into "
+          "the mobile score, so an engine is never penalised for what it cannot "
+          "execute. UNTESTED means untested, never a pass. Note: these are "
+          "interaction-check <em>invocations</em> — a different population from "
+          "the pass/fail regression tests in the header above; the two counts "
+          "are not comparable.</p>"
+    ) if coverage_lines else ""
+    stat_strip = (
+        "<div style='display:flex;gap:10px;flex-wrap:wrap;margin:4px 0 6px'>"
+        + "".join(strip_tiles) + "</div>" + coverage_html
+    )
+
+    engine_note = (f" &nbsp;·&nbsp; engine(s): {', '.join(engines)}" if engines else "")
+
+    ai_html = _render_mobile_ai_triage(total_groups=len(groups))
+
+    return f"""
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <h2 style="margin:0">Mobile</h2>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">{''.join(chips)}</div>
+      </div>
+      <p style="font-size:11px;color:#64748b;margin:0 0 8px">
+        Findings from the mobile suite{engine_note}. Only <strong>blocker</strong>
+        fails a test; major/minor/info are recorded here.
+      </p>
+      {stat_strip}
+      {pattern_html}
+      {ai_html}
+      {untested_note}
+      <details style="margin-top:8px">
+        <summary style="font-size:11px;color:#64748b;cursor:pointer;font-weight:700">
+          All {len(findings)} raw findings (per device/page — the evidence behind the patterns above)
+        </summary>
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse">
+            <thead><tr>
+              <th style="text-align:left;font-size:10px;padding:6px 10px;border-bottom:2px solid #e2e8f0">Severity</th>
+              <th style="text-align:left;font-size:10px;padding:6px 10px;border-bottom:2px solid #e2e8f0">Engine</th>
+              <th style="text-align:left;font-size:10px;padding:6px 10px;border-bottom:2px solid #e2e8f0">Page</th>
+              <th style="text-align:left;font-size:10px;padding:6px 10px;border-bottom:2px solid #e2e8f0">Device</th>
+              <th style="text-align:left;font-size:10px;padding:6px 10px;border-bottom:2px solid #e2e8f0">Check</th>
+              <th style="text-align:left;font-size:10px;padding:6px 10px;border-bottom:2px solid #e2e8f0">Finding</th>
+            </tr></thead>
+            <tbody>{''.join(rows)}</tbody>
+          </table>
+        </div>
+      </details>
     </div>
     """
 

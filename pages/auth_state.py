@@ -3,23 +3,56 @@ Auth-state predicates. Python port of Java `pages.auth.AuthState`.
 
 The Java tests treat any of these conditions as "the user has reached
 a valid auth state":
-  - The IdP host (accounts.appypie.com) is visible
+  - A recognised IdP host is visible (see AUTH_HOSTS)
   - The URL is on an /login or /signup route
   - Local storage / cookies show session tokens
 
 We mirror exactly. Predicates intentionally tolerant — auth flows
 have many valid intermediate states.
+
+AUTH_HOSTS is the single source of truth for "is this an auth host?" across
+the framework. It lives here because both auth_helper and authv2_helper
+already sit above this module, so there is no import cycle.
 """
 
 from __future__ import annotations
 
+import os
+
 from playwright.sync_api import Page
+
+
+# Recognised auth IdP hosts, current first.
+#
+#   accounts.flozic.ai   — the live AWS Cognito Hosted UI (as of 2026-08-11)
+#   authv2.flozic.ai     — the same Hosted UI's previous hostname. Kept so a
+#                          product-side rollback doesn't break the suite.
+#   accounts.appypie.com — the legacy pre-Cognito login form.
+#
+# When the auth host moves again, this tuple is the only place that needs
+# editing. Point the suite at a staging IdP without a code change via
+# FLOZIC_AUTH_HOSTS="host-a,host-b".
+_DEFAULT_AUTH_HOSTS = (
+    "accounts.flozic.ai",
+    "authv2.flozic.ai",
+    "accounts.appypie.com",
+)
+
+AUTH_HOSTS: tuple[str, ...] = tuple(
+    h.strip() for h in os.environ.get("FLOZIC_AUTH_HOSTS", "").split(",") if h.strip()
+) or _DEFAULT_AUTH_HOSTS
+
+
+def is_on_auth_host(url: str | None) -> bool:
+    """True iff `url` is on any recognised auth host. Takes a string rather
+    than a Page so callers inside `wait_for_url` predicates can use it."""
+    u = url or ""
+    return any(host in u for host in AUTH_HOSTS)
 
 
 def is_on_idp(page: Page) -> bool:
     """True iff current URL is on a recognised auth IdP host."""
-    url = page.url or ""
-    return "accounts.appypie.com" in url or "authv2.flozic.ai" in url
+    return is_on_auth_host(page.url)
 
 
 def is_on_auth_route(page: Page) -> bool:
