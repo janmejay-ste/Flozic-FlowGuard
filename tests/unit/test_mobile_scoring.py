@@ -54,7 +54,7 @@ def finding(severity="major", category="sticky"):
 
 
 def test_scoring_version_pinned():
-    assert SCORING_VERSION == 2, (
+    assert SCORING_VERSION == 3, (
         f"Scoring changed to v{SCORING_VERSION}. Update this test and confirm "
         "trend consumers can distinguish the versions."
     )
@@ -730,3 +730,37 @@ def test_tallied_classifies_all_three_outcomes():
     assert stats["webkit"] == {"attempted": 2, "executed": 0, "na_structural": 1}
     # Chromium: 1 attempted, 1 executed (clean), 0 na_structural
     assert stats["chromium"] == {"attempted": 1, "executed": 1, "na_structural": 0}
+
+
+# ── Quality curve (v3 mobile model) ────────────────────────────────────
+
+
+def _mk(sev, cat, device, elem):
+    return {"severity": sev, "category": cat, "device": device, "page": "homepage",
+            "message": f"A '{elem}' is 80x30px on {device} — below the 44px recommended minimum."}
+
+def test_quality_discriminates_light_from_heavy():
+    from utils.layered_health_scores import _mobile_quality
+    devices = ["iPhone SE","iPhone 13","iPhone 14 Pro Max","Pixel 5","Galaxy S9+","iPad Mini"]
+    light = [_mk("minor","tap_target","iPhone SE",f"E{i}") for i in range(20)]      # 20 single-device patterns
+    heavy = [_mk("minor","tap_target",d,f"E{i}") for i in range(20) for d in devices] + \
+            [_mk("minor","tap_target",d,f"F{i}") for i in range(30) for d in devices]
+    q_light, _ = _mobile_quality(light)
+    q_heavy, _ = _mobile_quality(heavy)
+    assert q_light > q_heavy
+    assert q_light >= 85           # a light run scores well
+    assert 40 <= q_heavy <= 75     # a heavy run is mediocre, not floored
+
+def test_quality_ceiling_major_and_blocker():
+    from utils.layered_health_scores import _mobile_quality
+    one_major = [_mk("major","overflow","iPhone SE","X") ]
+    q_major, _ = _mobile_quality(one_major)
+    assert q_major <= 55           # a lone major cannot look healthy
+    one_blocker = [_mk("blocker","scroll","iPhone SE","Y")]
+    q_blocker, _ = _mobile_quality(one_blocker)
+    assert q_blocker <= 20
+
+def test_quality_empty_is_100():
+    from utils.layered_health_scores import _mobile_quality
+    q, counts = _mobile_quality([])
+    assert q == 100 and counts == {"blocker": 0, "major": 0, "minor": 0}

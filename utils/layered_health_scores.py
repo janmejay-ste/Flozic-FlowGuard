@@ -41,11 +41,51 @@ from utils.error_clusterer import ErrorCluster
 #        weights renormalise to exactly v1, so a run with no mobile tests
 #        scores identically under v1 and v2 -- the bump is not a silent
 #        rescoring of the existing suite.
-SCORING_VERSION = 2
+SCORING_VERSION = 3
 
 # Mobile penalties, mirroring the cluster model above.
+# (v2 penalty model; kept for backwards compatibility with compute() until Task 3 rewrites the band)
 _MOBILE_PENALTY = {"blocker": 25, "major": 8, "minor": 3}
 _MOBILE_PENALTY_CAP = 60
+
+# v3 mobile model. PROVISIONAL constants — see the calibration plan in
+# docs/superpowers/specs/2026-08-25-mobile-scoring-v3-design.md. K and the
+# ceilings have no major/blocker mobile data to fit against yet.
+import math
+
+_MOBILE_SEV_WEIGHT = {"minor": 1.0, "major": 5.0, "blocker": 12.0}
+_MOBILE_K = 120.0                    # Quality = 50 at Σ ≈ 83 weighted patterns
+_MOBILE_CEILING_BLOCKER = 20
+_MOBILE_CEILING_MAJOR = 55
+_MOBILE_COVERAGE_GATE = 0.33
+
+
+def _mobile_quality(findings):
+    """Quality 0–100 from unique issue patterns: severity × device-reach on a
+    saturating curve, capped by the worst severity present."""
+    from utils.ai_mobile_triage import group_findings
+    counts = {"blocker": 0, "major": 0, "minor": 0}
+    for f in findings:
+        s = (f.get("severity") or "").lower()
+        if s in counts:
+            counts[s] += 1
+    groups = group_findings(findings)
+    if not groups:
+        return 100, counts
+    total_dev = len({f.get("device") for f in findings if f.get("device")}) or 1
+
+    def reach(n):
+        return 0.5 + (n - 1) / max(total_dev - 1, 1)
+
+    sigma = sum(_MOBILE_SEV_WEIGHT[g["severity"]] * reach(len(g["devices"]))
+                for g in groups)
+    quality = round(100 * math.exp(-sigma / _MOBILE_K))
+    if any(g["severity"] == "blocker" for g in groups):
+        quality = min(quality, _MOBILE_CEILING_BLOCKER)
+    elif any(g["severity"] == "major" for g in groups):
+        quality = min(quality, _MOBILE_CEILING_MAJOR)
+    return quality, counts
+
 
 _W_WITH_MOBILE = {"product": 0.40, "infra": 0.25, "framework": 0.20, "mobile": 0.15}
 _W_NO_MOBILE = {"product": 0.50, "infra": 0.30, "framework": 0.20}
