@@ -1,5 +1,5 @@
 """
-Unit tests for Mobile as a scored domain (scoring v2).
+Unit tests for Mobile as a scored domain (scoring v3).
 
 The two properties that matter most here are both about NOT lying:
 
@@ -838,3 +838,19 @@ def test_real_run_scores_match_spec():
             pytest.skip(f"{path} predates 3-way tally")
         s = compute([], [], mobile_findings=d["findings"], mobile_tested=True, check_stats=cs)
         assert s.mobile_health == exp
+
+def test_dashboard_mobile_cell_shows_breakdown():
+    from utils.dashboard_builder import _mobile_cell
+    layered = types.SimpleNamespace(mobile_health=59, mobile_quality=59,
+                                    mobile_coverage=1.0, mobile_blocker=0,
+                                    mobile_major=0, mobile_minor=247, scoring_version=3)
+    out = _mobile_cell(layered)
+    assert "59" in out and "Quality" in out and "coverage" in out
+
+def test_dashboard_mobile_cell_insufficient_coverage():
+    from utils.dashboard_builder import _mobile_cell
+    layered = types.SimpleNamespace(mobile_health=None, mobile_quality=59,
+                                    mobile_coverage=0.2, mobile_blocker=0,
+                                    mobile_major=0, mobile_minor=10, scoring_version=3)
+    out = _mobile_cell(layered)
+    assert "INSUFFICIENT" in out.upper()

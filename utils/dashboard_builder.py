@@ -20,6 +20,7 @@ from utils.layered_health_scores import compute as _compute_layered, score_band
 from utils.mobile_report_builder import (
     mobile_was_exercised as _mobile_ran,
     session_findings as _mobile_findings,
+    session_check_stats as _mobile_check_stats,
 )
 from utils.error_clusterer import ErrorCluster
 
@@ -54,10 +55,16 @@ def build(records: list[TestRecord], started_at_ms: int) -> Path:
     # Mobile findings must be passed HERE too, not only in conftest. build()
     # computes its own layered scores, so omitting them would print
     # "Mobile: not measured" on the dashboard while the session log reported a
-    # real Mobile score for the same run.
+    # real Mobile score for the same run. check_stats must be resolved the
+    # same way conftest does it -- otherwise the trend-history entry appended
+    # below (from THIS score) records the undiscounted/ungated number while
+    # conftest logs the correct, coverage-gated one for the same run.
+    _cs = _mobile_check_stats()
+    _engine_cs = next(iter(_cs.values()), None) if _cs else None
     layered      = _compute_layered(records, clusters,
                                     mobile_findings=_mobile_findings(),
-                                    mobile_tested=_mobile_ran())
+                                    mobile_tested=_mobile_ran(),
+                                    check_stats=_engine_cs)
 
     _append_trend(stats, decision, started_at_ms, layered)
     trend = _load_trend()
@@ -1988,14 +1995,21 @@ def _mobile_cell(layered: Any) -> str:
     NOT MEASURED tile reads as "we did not look", which is the truth.
     """
     score = getattr(layered, "mobile_health", None)
+    quality = getattr(layered, "mobile_quality", None)
+    cov = getattr(layered, "mobile_coverage", None)
     if score is None:
+        # Insufficient coverage (quality computed but too little ran) vs never ran.
+        if quality is not None and cov is not None:
+            note = f"INSUFFICIENT COVERAGE ({round(cov * 100)}% executed)"
+        else:
+            note = "NOT MEASURED"
         return (
             "<div class='tint-surface' style='text-align:center;background:#f1f5f9;"
             "border-radius:8px;padding:14px 10px;border:1px dashed #94a3b855'>"
             "<div style='font-size:22px;font-weight:800;color:#64748b'>&mdash;</div>"
             "<div style='font-size:9px;font-weight:700;text-transform:uppercase;"
             "letter-spacing:0.6px;color:#64748b;margin-top:4px'>Mobile</div>"
-            "<div style='font-size:9px;color:#94a3b8;margin-top:2px'>NOT MEASURED</div>"
+            f"<div style='font-size:9px;color:#94a3b8;margin-top:2px'>{note}</div>"
             "</div>"
         )
     band_label, color, bg = score_band(score)
@@ -2004,6 +2018,8 @@ def _mobile_cell(layered: Any) -> str:
         f"{getattr(layered, 'mobile_major', 0)}Maj / "
         f"{getattr(layered, 'mobile_minor', 0)}Min"
     )
+    breakdown = (f"Quality {quality} × {round(cov * 100)}% coverage"
+                 if quality is not None and cov is not None else counts)
     return (
         f"<div class='tint-surface' style='text-align:center;background:{bg};"
         f"border-radius:8px;padding:14px 10px;border:1px solid {color}33'>"
@@ -2011,6 +2027,7 @@ def _mobile_cell(layered: Any) -> str:
         f"<div style='font-size:9px;font-weight:700;text-transform:uppercase;"
         f"letter-spacing:0.6px;color:{color};margin-top:4px'>Mobile</div>"
         f"<div style='font-size:9px;color:#94a3b8;margin-top:2px'>{counts}</div>"
+        f"<div style='font-size:9px;color:#94a3b8;margin-top:1px'>{breakdown}</div>"
         f"</div>"
     )
 

@@ -245,19 +245,25 @@ def _mobile_score_box(scores) -> str:
     """Fourth score box. 'Not measured' is rendered explicitly — an absent box
     would read as fine, a grey box reads as 'we did not look'."""
     m = getattr(scores, "mobile_health", None)
+    quality = getattr(scores, "mobile_quality", None)
+    cov = getattr(scores, "mobile_coverage", None)
     if m is None:
+        sub = ("Mobile (insufficient coverage)"
+               if quality is not None and cov is not None else "Mobile (not measured)")
         return (
             '<div class="score-box" style="background:#f1f5f9;'
             'border:1px dashed #94a3b866">'
             '<div class="score" style="color:#64748b">&mdash;</div>'
-            '<div class="sub" style="color:#64748b">Mobile (not measured)</div>'
+            f'<div class="sub" style="color:#64748b">{sub}</div>'
             "</div>"
         )
     _, color, bg = score_band(m)
+    sub = (f"Mobile — Q{quality} × {round(cov * 100)}%"
+           if quality is not None and cov is not None else "Mobile Health")
     return (
         f'<div class="score-box" style="background:{bg};border:1px solid {color}44">'
         f'<div class="score" style="color:{color}">{m}</div>'
-        f'<div class="sub" style="color:{color}">Mobile Health</div>'
+        f'<div class="sub" style="color:{color}">{sub}</div>'
         "</div>"
     )
 
