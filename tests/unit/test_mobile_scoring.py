@@ -854,3 +854,33 @@ def test_dashboard_mobile_cell_insufficient_coverage():
                                     mobile_major=0, mobile_minor=10, scoring_version=3)
     out = _mobile_cell(layered)
     assert "INSUFFICIENT" in out.upper()
+
+def test_dashboard_mobile_cell_not_measured():
+    from utils.dashboard_builder import _mobile_cell
+    layered = types.SimpleNamespace(mobile_health=None, mobile_quality=None,
+                                    mobile_coverage=None, mobile_blocker=0,
+                                    mobile_major=0, mobile_minor=0, scoring_version=3)
+    out = _mobile_cell(layered)
+    assert "NOT MEASURED" in out.upper()
+    assert "INSUFFICIENT" not in out.upper()
+
+def test_pdf_mobile_score_box_shows_breakdown():
+    from utils.pdf_report_builder import _mobile_score_box
+    scores = types.SimpleNamespace(mobile_health=59, mobile_quality=59,
+                                   mobile_coverage=1.0, scoring_version=3)
+    out = _mobile_score_box(scores)
+    assert "Mobile — Q59 × 100%" in out
+
+def test_pdf_mobile_score_box_insufficient_coverage():
+    from utils.pdf_report_builder import _mobile_score_box
+    scores = types.SimpleNamespace(mobile_health=None, mobile_quality=59,
+                                   mobile_coverage=0.2, scoring_version=3)
+    out = _mobile_score_box(scores)
+    assert "insufficient coverage" in out
+
+def test_pdf_mobile_score_box_not_measured():
+    from utils.pdf_report_builder import _mobile_score_box
+    scores = types.SimpleNamespace(mobile_health=None, mobile_quality=None,
+                                   mobile_coverage=None, scoring_version=3)
+    out = _mobile_score_box(scores)
+    assert "not measured" in out
