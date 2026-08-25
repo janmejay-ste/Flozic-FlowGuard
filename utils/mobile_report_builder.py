@@ -85,7 +85,7 @@ def note_check_run(engine: str, executed: bool, structural: bool = False) -> Non
 
 
 def session_check_stats() -> dict[str, dict[str, int]]:
-    """Per-engine {attempted, executed} interaction-check tallies."""
+    """Per-engine {attempted, executed, na_structural} interaction-check tallies."""
     return {k: dict(v) for k, v in _SESSION_CHECKS.items()}
 
 

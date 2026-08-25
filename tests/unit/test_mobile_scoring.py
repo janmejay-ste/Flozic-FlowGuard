@@ -691,3 +691,42 @@ def test_check_tally_records_structural_separately():
     assert mrb.session_check_stats()["webkit"] == {
         "attempted": 3, "executed": 1, "na_structural": 1,
     }
+
+
+def test_tallied_classifies_all_three_outcomes():
+    """Exercise _tallied's classification routing directly via a minimal stub.
+
+    Covers all three branches:
+    - UNSUPPORTED/UNTESTED message -> structural=True (na_structural)
+    - NOT verified message -> structural=False (crash, non-structural)
+    - No gap message -> executed=True (clean)
+    """
+    import utils.mobile_report_builder as mrb
+    from utils.mobile_interaction_auditor import _tallied
+    from utils.mobile_layout_auditor import Inconsistency
+
+    class Stub:
+        def __init__(self, engine):
+            self.engine = engine
+            self.findings = []
+
+        @_tallied
+        def emit(self, sev_msg):
+            if sev_msg:
+                self.findings.append(Inconsistency(
+                    page="p", device="d", category="scroll",
+                    severity="info", message=sev_msg))
+
+    mrb.reset_session_findings()
+    # UNSUPPORTED -> structural gap (na_structural=1, executed=0)
+    Stub("webkit").emit("Touch gesture UNSUPPORTED on webkit")
+    # NOT verified -> crash, non-structural (executed=0, na_structural=0)
+    Stub("webkit").emit("Check raised AttributeError: this interaction was NOT verified.")
+    # No gap message -> executed clean (executed=1, na_structural=0)
+    Stub("chromium").emit("")
+
+    stats = mrb.session_check_stats()
+    # WebKit: 2 attempted, 0 executed (one structural, one crash), 1 na_structural
+    assert stats["webkit"] == {"attempted": 2, "executed": 0, "na_structural": 1}
+    # Chromium: 1 attempted, 1 executed (clean), 0 na_structural
+    assert stats["chromium"] == {"attempted": 1, "executed": 1, "na_structural": 0}
