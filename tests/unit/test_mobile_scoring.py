@@ -635,8 +635,10 @@ def test_dashboard_stat_strip_and_coverage_lines(monkeypatch):
     import utils.mobile_report_builder as mrb
     monkeypatch.setattr(mrb, "load_engine_summaries",
                         lambda base="reports/trend": [
-        {"engine": "chromium", "check_stats": {"attempted": 100, "executed": 78}},
-        {"engine": "webkit", "check_stats": {"attempted": 100, "executed": 50}},
+        {"engine": "chromium",
+         "check_stats": {"attempted": 100, "executed": 78, "na_structural": 0}},
+        {"engine": "webkit",
+         "check_stats": {"attempted": 100, "executed": 50, "na_structural": 40}},
     ])
     findings = [{"severity": "minor", "engine": "webkit", "page": "pricing",
                  "device": "iPhone SE", "category": "tap_target",
@@ -650,9 +652,18 @@ def test_dashboard_stat_strip_and_coverage_lines(monkeypatch):
     assert ">Findings<" in out and ">Unique patterns<" in out
     assert ">Coverage gaps<" in out
     assert ">Blocker<" in out and ">Major<" in out and ">Minor<" in out
-    assert "chromium</strong> 78% executed (78/100 interaction checks)" in out
-    assert "webkit</strong> 50% executed (50/100 interaction checks)" in out
-    assert "never affects the score" in out
+    # Raw execution AND scoring coverage are shown distinctly. chromium has no
+    # N/A so both read 78%; webkit's 40 structural N/A make raw 50% but scoring
+    # 50/60 = 83% — the exact "67 vs 100" divergence a reviewer must not have
+    # to reconcile alone.
+    assert "chromium</strong> 78% raw execution (78/100)" in out
+    assert "78% scoring coverage (78/100)" in out
+    assert "webkit</strong> 50% raw execution (50/100)" in out
+    assert "83% scoring coverage (50/60, 40 N/A — structurally unsupported)" in out
+    # Populations are labelled so 216 interaction checks are not compared to the
+    # regression-test count in the header.
+    assert "different population from" in out and "not comparable" in out
+    assert "multiplied into" in out  # explains why scoring coverage is the score input
 
 
 def test_direct_check_invocation_is_tallied():
@@ -922,3 +933,42 @@ def test_pdf_mobile_score_box_not_measured():
                                    mobile_coverage=None, scoring_version=3)
     out = _mobile_score_box(scores)
     assert "not measured" in out
+
+
+# ── Executive summary is deterministic and does not overclaim ──────────
+
+
+def test_exec_summary_no_release_verdict_when_findings_exist():
+    """A green regression run WITH mobile findings must NOT read 'recommended
+    for release' / 'meets all requirements'. Test-execution readiness and
+    product findings are held apart; the release call stays the Python
+    decision, not an AI verdict."""
+    from utils.ai_exec_summary import summarize
+    st = {"passed": 182, "failed": 0, "total": 182, "pass_rate": 100.0}
+    out = summarize(st, [], "READY",
+                    mobile={"findings": 247, "patterns": 86, "coverage_gaps": 78})
+    low = out.lower()
+    assert "recommended for release" not in low
+    assert "meets all requirements" not in low
+    assert "247 product finding" in out and "86 issue pattern" in out
+    assert "78 mobile check(s) are structurally untestable" in out
+    assert "reviewed separately before release" in out
+    assert "test-execution perspective the run is READY" in out
+
+
+def test_exec_summary_clean_run_no_mobile_is_plain():
+    """No mobile findings, all green: a simple factual line, still no overclaim."""
+    from utils.ai_exec_summary import summarize
+    st = {"passed": 10, "failed": 0, "total": 10, "pass_rate": 100.0}
+    out = summarize(st, [], "READY", mobile=None)
+    assert "All 10 regression tests completed successfully" in out
+    assert "Release decision: READY" in out
+    assert "meets all requirements" not in out.lower()
+
+
+def test_exec_summary_failures_demand_triage():
+    from utils.ai_exec_summary import summarize
+    st = {"passed": 8, "failed": 2, "total": 10, "pass_rate": 80.0}
+    out = summarize(st, [], "NOT_READY", mobile=None)
+    assert "8 of 10 regression tests passed" in out and "2 failed" in out
+    assert "Resolve the failing tests before release" in out

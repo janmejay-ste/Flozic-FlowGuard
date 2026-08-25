@@ -1615,25 +1615,43 @@ def _render(
     run_time  = datetime.fromtimestamp(started_at_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # AI executive summary — falls back to a deterministic plain-language
-    # summary when OPENAI_API_KEY is unset. Numeric metrics are computed
-    # in Python and rendered separately; GPT only narrates.
+    # Executive summary — DETERMINISTIC, composed from the run's real numbers
+    # (see utils/ai_exec_summary). It is fed the mobile finding/coverage-gap
+    # context so it cannot claim "all requirements met / recommended for
+    # release" off the pytest pass count while blind to product findings.
     exec_html = ""
     try:
-        from utils.ai_exec_summary import summarize as _ai_summarize
-        ai_summary = _ai_summarize(stats, records, decision.status.value)
+        from utils.ai_exec_summary import summarize as _exec_summarize
+        _mf = _mobile_findings()
+        _mobile_ctx = None
+        if _mf:
+            from utils.ai_mobile_triage import group_findings
+            _actionable = sum(
+                1 for x in _mf
+                if (x.get("severity") or "").lower() in ("blocker", "major", "minor"))
+            _gaps = sum(
+                1 for x in _mf
+                if "UNTESTED" in (x.get("message") or "")
+                or "UNSUPPORTED" in (x.get("message") or ""))
+            _mobile_ctx = {
+                "findings": _actionable,
+                "patterns": len(group_findings(_mf)),
+                "coverage_gaps": _gaps,
+            }
+        exec_summary = _exec_summarize(
+            stats, records, decision.status.value, mobile=_mobile_ctx)
     except Exception as e:
         logger.warning("Exec summary failed (non-fatal): %s", e)
-        ai_summary = ""
-    if ai_summary:
+        exec_summary = ""
+    if exec_summary:
         exec_html = (
             "<div class='tint-surface' style='background:#f8fafc;border-left:4px solid #0ea5e9;"
             "padding:14px 18px;margin-bottom:18px;border-radius:6px;'>"
             "<div style='font-size:10px;font-weight:700;color:#0284c7;"
             "text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;'>"
-            "🤖 AI Executive Summary"
+            "Executive Summary"
             "</div>"
-            f"<div style='font-size:13px;color:#1e293b;line-height:1.5;'>{ai_summary}</div>"
+            f"<div style='font-size:13px;color:#1e293b;line-height:1.5;'>{exec_summary}</div>"
             "</div>"
         )
 
@@ -1930,7 +1948,7 @@ def _render(
 
   <!-- All test results -->
   <div class="card">
-    <h2>Test Results ({stats["total"]} tests · {_fmt_ms(stats["total_ms"])} total)</h2>
+    <h2>Test Results ({stats["total"]} regression tests · {_fmt_ms(stats["total_ms"])} total)</h2>
     {toolbar_html}
     <table id="test-results-table">
       <thead><tr>
@@ -2409,6 +2427,11 @@ def _render_mobile_section(findings: list[dict], layered: Any = None) -> str:
     # Executed coverage per engine, from the sidecars (each engine's last
     # run). Derived from the auditor's attempt tally, NOT from findings — a
     # check that runs clean emits nothing, so findings under-count execution.
+    # Two coverage figures, because a reviewer must not have to reconcile
+    # "67% executed" against "Quality × 100% coverage" themselves:
+    #   raw execution  = executed / attempted            (all invocations)
+    #   scoring coverage = executed / (attempted − N/A)   (drops structurally
+    #                      unsupported checks; THIS is what multiplies Quality)
     coverage_lines = []
     try:
         from utils.mobile_report_builder import load_engine_summaries
@@ -2416,20 +2439,33 @@ def _render_mobile_section(findings: list[dict], layered: Any = None) -> str:
             cs = s.get("check_stats") or {}
             att = int(cs.get("attempted") or 0)
             exe = int(cs.get("executed") or 0)
+            na  = int(cs.get("na_structural") or 0)
             if att:
+                executable = att - na
+                raw_pct = round(100 * exe / att)
+                scor_pct = round(100 * exe / executable) if executable > 0 else 0
+                eng = html.escape(str(s.get("engine", "?")))
                 coverage_lines.append(
-                    f"<strong>{html.escape(str(s.get('engine', '?')))}</strong> "
-                    f"{round(100 * exe / att)}% executed "
-                    f"({exe}/{att} interaction checks)"
+                    f"<strong>{eng}</strong> "
+                    f"{raw_pct}% raw execution ({exe}/{att}) &nbsp;·&nbsp; "
+                    f"{scor_pct}% scoring coverage ({exe}/{executable}"
+                    + (f", {na} N/A — structurally unsupported" if na else "")
+                    + ")"
                 )
     except Exception:
         pass
     coverage_html = (
-        "<p style='font-size:11px;color:#64748b;margin:2px 0 8px'>Coverage: "
-        + " &nbsp;·&nbsp; ".join(coverage_lines)
-        + " — share of attempted interaction checks that actually ran on that "
-          "engine. UNTESTED is missing coverage, not a pass, and never "
-          "affects the score.</p>"
+        "<p style='font-size:11px;color:#64748b;margin:2px 0 8px'>Coverage — "
+        + " &nbsp;|&nbsp; ".join(coverage_lines)
+        + ". <strong>Raw execution</strong> is the share of all interaction-check "
+          "invocations that ran; <strong>scoring coverage</strong> excludes checks "
+          "the engine structurally cannot run (N/A — e.g. WebKit lacks the "
+          "Chromium CDP gesture/network APIs) and is the figure multiplied into "
+          "the mobile score, so an engine is never penalised for what it cannot "
+          "execute. UNTESTED means untested, never a pass. Note: these are "
+          "interaction-check <em>invocations</em> — a different population from "
+          "the pass/fail regression tests in the header above; the two counts "
+          "are not comparable.</p>"
     ) if coverage_lines else ""
     stat_strip = (
         "<div style='display:flex;gap:10px;flex-wrap:wrap;margin:4px 0 6px'>"

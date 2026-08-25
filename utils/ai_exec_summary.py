@@ -1,92 +1,94 @@
 """
-AI-generated executive summary for the dashboard.
+Executive summary for the dashboard — DETERMINISTIC, not AI-generated.
 
 At session teardown, the dashboard builder calls summarize() with the run's
-stats + records. Returns a 2-3 sentence high-level summary suitable for
-non-QA stakeholders (PM, eng leads). The summary is embedded at the top
-of the dashboard.
+stats + records (+ optional mobile finding context). Returns a short
+high-level summary for non-QA stakeholders (PM, eng leads), embedded at the
+top of the dashboard.
 
-Provider-agnostic — Claude or OpenAI, selected by env vars. See
-utils/ai_provider.py for the selection rules.
-
-Skip behaviour:
-  - No provider configured -> deterministic plain-language fallback.
-  - Provider error          -> the same fallback (no test break).
+It is composed from the run's real numbers on purpose. The release call is a
+decision (`decision_status`, computed in Python), not a sentence a model
+should invent — this repo's rule is the AI observes and Python decides, and
+"Recommended for release" is a verdict. A deterministic summary also cannot
+hallucinate metrics or overclaim "meets all requirements" off the pytest
+pass count while blind to the mobile findings. (The prior AI version did both.)
 """
 
 from __future__ import annotations
 
-import json
 import logging
 
 logger = logging.getLogger(__name__)
 
-MODULE = "ai_exec_summary"
 
+def summarize(
+    stats: dict,
+    records: list,
+    decision_status: str = "READY",
+    mobile: dict | None = None,
+) -> str:
+    """Build a short executive summary — DETERMINISTIC, composed from the run's
+    real numbers.
 
-def _fallback_summary(stats: dict, decision_status: str) -> str:
-    """Deterministic plain-language summary used when GPT is unavailable."""
+    Why not AI here: an executive summary that ends "Recommended for release"
+    is a RELEASE VERDICT, and in this repo the AI observes while Python decides
+    — the release call is `decision_status`, computed deterministically, not a
+    sentence a model invents. An earlier AI version also (a) hallucinated
+    metrics it was told to withhold and (b) declared "meets all requirements /
+    Recommended for release" off the pytest pass count alone, blind to the
+    mobile findings. Composing from the real figures fixes both: it cannot
+    overclaim, and it keeps test-execution readiness separate from product
+    findings that still need review.
+
+    `mobile`, when present: {"findings": int, "patterns": int,
+    "coverage_gaps": int} — the actionable mobile finding/pattern counts and
+    the number of structurally-untestable (UNTESTED/UNSUPPORTED) checks.
+    """
     p, f, t = stats["passed"], stats["failed"], stats["total"]
-    rate    = stats["pass_rate"]
     if t == 0:
         return "No tests ran in this session."
+
+    parts: list[str] = []
     if f == 0:
-        return (
-            f"All {t} tests passed ({rate}%). Release decision: {decision_status}."
+        parts.append(
+            f"All {t} regression tests completed successfully with no test failures."
         )
-    return (
-        f"{p}/{t} tests passed ({rate}%). {f} failed. "
-        f"Release decision: {decision_status}. "
-        "See failing rows below for triage details."
-    )
-
-
-def summarize(stats: dict, records: list, decision_status: str = "READY") -> str:
-    """
-    Build a short executive summary. Always returns a non-empty string —
-    falls back to a deterministic summary when GPT is unavailable.
-    """
-    from utils import ai_prompts
-    from utils.ai_parser import send_text
-    from utils.ai_provider import PROVIDER_NAME
-
-    if PROVIDER_NAME == "noop":
-        return _fallback_summary(stats, decision_status)
-
-    failed = [r for r in records if getattr(r, "status", "") == "FAIL"]
-    failed_names = [r.method for r in failed[:10]]
-
-    # We DELIBERATELY do not pass numeric counts/percentages in a form the
-    # model is tempted to restate. Numbers are computed and rendered by the
-    # dashboard separately; here the model only narrates the situation and
-    # gives one recommendation. (Past versions that passed pass_rate=94.3%
-    # got it hallucinated back as "94.5%".)
-    qualitative = (
-        "all tests passed"   if stats["failed"] == 0 else
-        "mostly passed"      if stats["pass_rate"] >= 80 else
-        "mixed results"      if stats["pass_rate"] >= 50 else
-        "mostly failed"
-    )
-
-    try:
-        resp = send_text(
-            ai_prompts.render(
-                "exec_summary",
-                qualitative=qualitative,
-                decision_status=decision_status,
-                failed_names=json.dumps(failed_names),
-            ),
-            module=MODULE,
-            system_prompt=ai_prompts.system_for("exec_summary"),
-            max_tokens=400,
+    else:
+        parts.append(
+            f"{p} of {t} regression tests passed; {f} failed and need triage "
+            "(see the failing rows below)."
         )
-    except Exception as e:
-        logger.warning("[AI-exec] request failed: %s — using fallback", e)
-        return _fallback_summary(stats, decision_status)
 
-    if resp.error:
-        logger.warning("[AI-exec] %s error: %s — using fallback",
-                       resp.provider, resp.error)
-        return _fallback_summary(stats, decision_status)
+    if mobile:
+        nfind = int(mobile.get("findings") or 0)
+        npat = int(mobile.get("patterns") or 0)
+        ngap = int(mobile.get("coverage_gaps") or 0)
+        if nfind:
+            parts.append(
+                f"The mobile suite identified {nfind} product finding(s) across "
+                f"{npat} issue pattern(s) — see the Mobile section for severity "
+                "and device reach."
+            )
+        if ngap:
+            parts.append(
+                f"{ngap} mobile check(s) are structurally untestable on the "
+                "engine (unsupported CDP capabilities); these are reported as "
+                "UNTESTED and excluded from scoring, not counted as passes."
+            )
 
-    return (resp.text or "").strip() or _fallback_summary(stats, decision_status)
+    # The release framing comes from the Python-computed decision, and product
+    # findings are explicitly held apart from test-execution readiness.
+    if f == 0 and (mobile and (mobile.get("findings") or mobile.get("coverage_gaps"))):
+        parts.append(
+            f"From a test-execution perspective the run is {decision_status}; "
+            "the product findings above should be reviewed separately before "
+            "release."
+        )
+    elif f == 0:
+        parts.append(f"Release decision: {decision_status}.")
+    else:
+        parts.append(
+            f"Release decision: {decision_status}. Resolve the failing tests "
+            "before release."
+        )
+    return " ".join(parts)
