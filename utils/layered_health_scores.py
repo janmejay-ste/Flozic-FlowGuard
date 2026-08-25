@@ -27,6 +27,7 @@ Usage:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -43,16 +44,9 @@ from utils.error_clusterer import ErrorCluster
 #        rescoring of the existing suite.
 SCORING_VERSION = 3
 
-# Mobile penalties, mirroring the cluster model above.
-# (v2 penalty model; kept for backwards compatibility with compute() until Task 3 rewrites the band)
-_MOBILE_PENALTY = {"blocker": 25, "major": 8, "minor": 3}
-_MOBILE_PENALTY_CAP = 60
-
 # v3 mobile model. PROVISIONAL constants — see the calibration plan in
 # docs/superpowers/specs/2026-08-25-mobile-scoring-v3-design.md. K and the
 # ceilings have no major/blocker mobile data to fit against yet.
-import math
-
 _MOBILE_SEV_WEIGHT = {"minor": 1.0, "major": 5.0, "blocker": 12.0}
 _MOBILE_K = 120.0                    # Quality = 50 at Σ ≈ 83 weighted patterns
 _MOBILE_CEILING_BLOCKER = 20
@@ -87,6 +81,21 @@ def _mobile_quality(findings):
     return quality, counts
 
 
+def _mobile_coverage(check_stats):
+    """coverage = executed / executable, executable = attempted − na_structural.
+    None => not instrumented (cannot discount what we did not measure).
+    0.0  => nothing was executable (engine could run nothing)."""
+    if not check_stats:
+        return None
+    att = int(check_stats.get("attempted", 0) or 0)
+    if att == 0:
+        return None
+    executable = att - int(check_stats.get("na_structural", 0) or 0)
+    if executable <= 0:
+        return 0.0
+    return min(int(check_stats.get("executed", 0) or 0) / executable, 1.0)
+
+
 _W_WITH_MOBILE = {"product": 0.40, "infra": 0.25, "framework": 0.20, "mobile": 0.15}
 _W_NO_MOBILE = {"product": 0.50, "infra": 0.30, "framework": 0.20}
 
@@ -113,6 +122,8 @@ class LayeredScores:
     # mobile health for a run that never opened a mobile viewport is the same
     # false-signal class as scoring an unset env var against the product.
     mobile_health: int | None = None
+    mobile_quality: int | None = None
+    mobile_coverage: float | None = None
     mobile_major: int = 0
     mobile_minor: int = 0
     mobile_blocker: int = 0
@@ -124,6 +135,7 @@ def compute(
     clusters: Sequence[ErrorCluster],
     mobile_findings: Sequence[dict] | None = None,
     mobile_tested: bool | None = None,
+    check_stats: dict | None = None,
 ) -> LayeredScores:
     """
     Compute domain-split health scores from test records + JS error clusters.
@@ -197,23 +209,20 @@ def compute(
     # why the fixture reports the device list explicitly.
     tested = bool(mf) if mobile_tested is None else bool(mobile_tested)
     mobile_health: int | None = None
+    mobile_quality: int | None = None
+    mobile_coverage: float | None = None
     m_blocker = m_major = m_minor = 0
     if tested:
-        for f in mf:
-            sev = (f.get("severity") or "").lower()
-            if sev == "blocker":
-                m_blocker += 1
-            elif sev == "major":
-                m_major += 1
-            elif sev == "minor":
-                m_minor += 1
-        penalty = min(
-            m_blocker * _MOBILE_PENALTY["blocker"]
-            + m_major * _MOBILE_PENALTY["major"]
-            + m_minor * _MOBILE_PENALTY["minor"],
-            _MOBILE_PENALTY_CAP,
-        )
-        mobile_health = max(0, 100 - penalty)
+        mobile_quality, counts = _mobile_quality(mf)
+        m_blocker, m_major, m_minor = counts["blocker"], counts["major"], counts["minor"]
+        cov = _mobile_coverage(check_stats)
+        mobile_coverage = cov
+        if cov is None:
+            mobile_health = mobile_quality           # not instrumented: quality alone
+        elif cov < _MOBILE_COVERAGE_GATE:
+            mobile_health = None                      # insufficient coverage -> excluded
+        else:
+            mobile_health = round(mobile_quality * cov)
 
     # ── Overall (weighted) ────────────────────────────────────────────────────
     if mobile_health is None:
@@ -239,6 +248,8 @@ def compute(
         overall=overall,
         harness_fault_count=len(harness_faults),
         mobile_health=mobile_health,
+        mobile_quality=mobile_quality,
+        mobile_coverage=mobile_coverage,
         mobile_major=m_major,
         mobile_minor=m_minor,
         mobile_blocker=m_blocker,

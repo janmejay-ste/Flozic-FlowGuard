@@ -101,6 +101,7 @@ from utils.harness_errors import HarnessError, looks_like_connectivity_loss
 from utils.mobile_report_builder import (
     mobile_was_exercised as _mobile_ran,
     session_findings as _mobile_findings,
+    session_check_stats as _mobile_check_stats,
 )
 from utils.snapshot_writer import add_test_record, write_snapshot, _STATE
 from utils.dashboard_builder import build as build_dashboard
@@ -373,9 +374,12 @@ def session_teardown_snapshot(request: pytest.FixtureRequest) -> Iterator[None]:
         # Mobile findings are fed in so they can move the score. Empty on a
         # non-mobile run, which leaves Mobile as None and `overall` on the
         # original v1 weighting -- the version bump is not a silent rescoring.
+        _cs = _mobile_check_stats()
+        _engine_cs = next(iter(_cs.values()), None) if _cs else None
         scores   = compute_scores(records, clusters,
                                   mobile_findings=_mobile_findings(),
-                                  mobile_tested=_mobile_ran())
+                                  mobile_tested=_mobile_ran(),
+                                  check_stats=_engine_cs)
 
         logger.info(
             "[session] Health Score: %d/100 | Product: %d | Infra: %d | Framework: %d | "

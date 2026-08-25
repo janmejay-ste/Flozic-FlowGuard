@@ -96,22 +96,6 @@ def test_info_findings_do_not_penalise():
 # ── Penalties ──────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("sev, n, expected", [
-    ("minor", 1, 97),
-    ("major", 1, 92),
-    ("major", 3, 76),
-    ("blocker", 1, 75),
-])
-def test_penalty_scale(sev, n, expected):
-    assert compute([rec()], [], mobile_findings=[finding(sev)] * n).mobile_health == expected
-
-
-def test_penalty_is_capped_so_one_bad_page_cannot_zero_the_domain():
-    s = compute([rec()], [], mobile_findings=[finding("blocker")] * 50)
-    assert s.mobile_health == 40          # 100 - cap(60)
-    assert s.mobile_blocker == 50
-
-
 def test_counts_are_reported_separately_from_the_score():
     s = compute([rec()], [], mobile_findings=(
         [finding("blocker")] + [finding("major")] * 2 + [finding("minor")] * 3
@@ -180,7 +164,11 @@ def test_not_running_mobile_still_reports_none():
 def test_omitting_the_flag_falls_back_to_findings_presence():
     """Back-compat for callers that predate `mobile_tested`."""
     assert compute([rec()], [], mobile_findings=[]).mobile_health is None
-    assert compute([rec()], [], mobile_findings=[finding("major")]).mobile_health == 92
+    # v3: no check_stats passed -> not instrumented -> score is quality alone.
+    # One major-severity pattern, no coverage data: quality ceiling for a lone
+    # major is 55 (see _MOBILE_CEILING_MAJOR), and it hits that ceiling exactly
+    # here because sigma/_MOBILE_K rounds to a quality above 55 before the cap.
+    assert compute([rec()], [], mobile_findings=[finding("major")]).mobile_health == 55
 
 
 def test_mobile_was_exercised_tracks_devices_not_findings():
@@ -764,3 +752,65 @@ def test_quality_empty_is_100():
     from utils.layered_health_scores import _mobile_quality
     q, counts = _mobile_quality([])
     assert q == 100 and counts == {"blocker": 0, "major": 0, "minor": 0}
+
+
+# ── Coverage metric + gate (v3 mobile model, compute() integration) ────
+
+
+import json, types
+from utils.error_clusterer import ErrorCluster  # noqa: E402
+
+def _cov(att, exe, na):
+    return {"attempted": att, "executed": exe, "na_structural": na}
+
+def test_structural_gaps_do_not_discount():
+    from utils.layered_health_scores import compute
+    fs = [_mk("minor","tap_target","iPhone SE","A")]
+    # 100 attempted, 40 executed, 60 structural -> executable 40, coverage 40/40 = 1.0
+    s = compute([], [], mobile_findings=fs, mobile_tested=True, check_stats=_cov(100, 40, 60))
+    assert s.mobile_coverage == 1.0
+    assert s.mobile_health == s.mobile_quality      # no discount
+
+def test_nonstructural_crashes_discount():
+    from utils.layered_health_scores import compute
+    fs = [_mk("minor","tap_target","iPhone SE","A")]
+    # 100 attempted, 60 executed, 0 structural -> executable 100, coverage 0.6
+    s = compute([], [], mobile_findings=fs, mobile_tested=True, check_stats=_cov(100, 60, 0))
+    assert abs(s.mobile_coverage - 0.6) < 1e-9
+    assert s.mobile_health == round(s.mobile_quality * 0.6)
+
+def test_coverage_gate_returns_none():
+    from utils.layered_health_scores import compute
+    fs = [_mk("minor","tap_target","iPhone SE","A")]
+    s = compute([], [], mobile_findings=fs, mobile_tested=True, check_stats=_cov(100, 20, 0))  # 0.2 < 0.33
+    assert s.mobile_health is None                  # insufficient coverage
+    assert s.mobile_quality is not None             # quality still computed
+    s2 = compute([], [], mobile_findings=fs, mobile_tested=True, check_stats=_cov(100, 0, 100))  # executable 0
+    assert s2.mobile_health is None
+
+def test_no_coverage_instrumentation_scores_on_quality():
+    from utils.layered_health_scores import compute
+    fs = [_mk("minor","tap_target","iPhone SE","A")]
+    s = compute([], [], mobile_findings=fs, mobile_tested=True, check_stats=None)
+    assert s.mobile_coverage is None
+    assert s.mobile_health == s.mobile_quality
+
+def test_no_mobile_is_v1_identity():
+    from utils.layered_health_scores import compute
+    rec = types.SimpleNamespace(status="PASS", feature="Marketing", harness_fault=False)
+    s = compute([rec], [], mobile_findings=[], mobile_tested=False, check_stats=None)
+    assert s.mobile_health is None
+    assert s.scoring_version == 3
+    assert s.overall == 100          # product 100, renormalised 50/30/20, no mobile term
+
+def test_real_run_scores_match_spec():
+    from utils.layered_health_scores import compute
+    for path, exp in (("reports/trend/mobile-summary.json", 62),
+                      ("reports/trend/webkit/mobile-summary.json", 59)):
+        d = json.load(open(path))
+        cs = d.get("check_stats")
+        # older sidecars may still be 2-key; skip if na_structural absent
+        if not cs or "na_structural" not in cs:
+            import pytest; pytest.skip(f"{path} predates 3-way tally")
+        s = compute([], [], mobile_findings=d["findings"], mobile_tested=True, check_stats=cs)
+        assert s.mobile_health == exp
