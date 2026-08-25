@@ -63,9 +63,13 @@ def _tallied(fn):
     to it. A coverage denominator that misses invocations is its own
     reporting illusion.
 
-    executed=False when the check crashed OR could only report that it
-    couldn't run (UNTESTED/UNSUPPORTED/NOT verified). Content-driven
-    "nothing applicable on this page" counts as executed: we looked.
+    executed=False when the check crashed OR self-reported the run_all crash
+    sentinel ("...interaction was NOT verified.", ~line 1176) OR could only
+    report a capability gap (UNTESTED/UNSUPPORTED). Content-driven
+    "nothing applicable on this page" counts as executed: we looked — that
+    includes check_widget's "presence verified, contents NOT verified."
+    (~line 1013), which is a CONCLUSION about a cross-origin iframe, not a
+    coverage gap, so it must NOT match the crash sentinel below.
     """
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
@@ -81,8 +85,8 @@ def _tallied(fn):
             new = self.findings[before:]
             untested = any("UNTESTED" in f.message or "UNSUPPORTED" in f.message
                            for f in new)
-            crashed = any("NOT verified" in f.message for f in new)
-            if crashed or not ok:             # hard crash or added "NOT verified"
+            crashed = any("interaction was NOT verified" in f.message for f in new)
+            if crashed or not ok:             # hard crash or run_all's crash sentinel
                 note_check_run(self.engine, executed=False, structural=False)
             elif untested:                    # engine capability gap -> N/A
                 note_check_run(self.engine, executed=False, structural=True)

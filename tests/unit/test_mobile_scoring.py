@@ -720,6 +720,44 @@ def test_tallied_classifies_all_three_outcomes():
     assert stats["chromium"] == {"attempted": 1, "executed": 1, "na_structural": 0}
 
 
+def test_tallied_widget_contents_not_verified_counts_as_executed():
+    """Regression guard: check_widget's cross-origin-iframe CONCLUSION must
+    not be mistaken for the run_all crash sentinel.
+
+    check_widget (~line 1013) emits an INFO finding ending "...presence
+    verified, contents NOT verified." when the iframe body can't be
+    inspected (cross-origin). The launcher itself WAS found and verified;
+    only the third-party contents are opaque. That is content that was
+    looked at, not a coverage gap, so _tallied must classify it as
+    executed=True — unlike run_all's own sentinel ("...This interaction
+    was NOT verified.", ~line 1176), which IS a genuine crash/gap.
+    """
+    import utils.mobile_report_builder as mrb
+    from utils.mobile_interaction_auditor import _tallied
+    from utils.mobile_layout_auditor import Inconsistency
+
+    class Stub:
+        def __init__(self, engine):
+            self.engine = engine
+            self.findings = []
+
+        @_tallied
+        def emit(self, sev_msg):
+            self.findings.append(Inconsistency(
+                page="p", device="d", category="widget",
+                severity="info", message=sev_msg))
+
+    mrb.reset_session_findings()
+    Stub("webkit").emit(
+        "Widget iframe content could not be inspected on iPhone 13 "
+        "(TimeoutError) — presence verified, contents NOT verified.")
+
+    stats = mrb.session_check_stats()
+    # executed=True (the launcher was found; only contents were opaque),
+    # na_structural must NOT be set either -- this is not a coverage gap.
+    assert stats["webkit"] == {"attempted": 1, "executed": 1, "na_structural": 0}
+
+
 # ── Quality curve (v3 mobile model) ────────────────────────────────────
 
 

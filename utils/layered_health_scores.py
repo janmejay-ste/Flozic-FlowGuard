@@ -18,6 +18,8 @@ overall weighted score:
     — Penalised by: FRAMEWORK-domain clusters (ChunkLoadError, ExpressionChanged…).
 
 Overall = round(product × 0.50 + infra × 0.30 + framework × 0.20)
+  (with mobile data present, weights renormalise to 40/25/20/15 -- v2+ --
+  and Mobile itself is Quality × coverage, see SCORING_VERSION below -- v3)
 
 Usage:
     from utils.layered_health_scores import compute, LayeredScores
@@ -42,6 +44,14 @@ from utils.error_clusterer import ErrorCluster
 #        weights renormalise to exactly v1, so a run with no mobile tests
 #        scores identically under v1 and v2 -- the bump is not a silent
 #        rescoring of the existing suite.
+#   v3 = Mobile itself becomes Quality x coverage. Quality is severity x a
+#        device-reach curve computed over unique patterns (not raw finding
+#        counts), with worst-severity ceilings. Coverage is
+#        executed / executable (structural/N-A checks excluded from the
+#        denominator). The combined score is gated to None below 0.33
+#        executable coverage -- too little was looked at to trust a number.
+#        WITHOUT mobile data the weights still renormalise to exactly v1,
+#        same as v2.
 SCORING_VERSION = 3
 
 # v3 mobile model. PROVISIONAL constants — see the calibration plan in

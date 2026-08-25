@@ -15,7 +15,7 @@ under the same constitution as every other AI use in this repo:
 The model proposes a classification per finding GROUP from a closed enum.
 Python validates every proposal; anything outside the enum becomes
 NEEDS_HUMAN. The AI never touches severity, the Mobile score, or pass/fail —
-scoring stays deterministic (scoring v2). A wrong AI classification can waste
+scoring stays deterministic (scoring v3). A wrong AI classification can waste
 a reader's attention; it can never move a number.
 
 WHY GROUPS, NOT RAW FINDINGS
