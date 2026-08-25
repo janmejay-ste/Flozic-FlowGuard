@@ -32,7 +32,8 @@ no hard floor, no conflation.
 ## Model
 
 ```
-Mobile = round(Quality × coverage_factor)     # None if coverage gate not met (below)
+Mobile = None                       if executable == 0 or coverage < 0.33
+       = round(Quality × coverage)  otherwise
 ```
 
 ### Quality (0–100) — from unique issue patterns, not raw findings
@@ -66,7 +67,7 @@ Quality = min(severity_ceiling, round(100 × exp(−Σ weights / K)))
   55/20 are conservative rules, not fitted values. Calibrate when real
   major/blocker data appears.
 
-### coverage_factor — hybrid: discount only what should have run
+### coverage — hybrid: one metric, discounts only what should have run
 
 The coverage tally splits every interaction-check invocation three ways:
 
@@ -79,24 +80,29 @@ The coverage tally splits every interaction-check invocation three ways:
 - **failed_nonstructural** — attempted but crashed/flaked ("NOT verified").
   Stays in the denominator as a real coverage gap.
 
-Two distinct metrics — one gates, one discounts (kept separate on purpose):
+One coverage metric, used both to gate and to discount:
 
 ```
-executable      = attempted − na_structural
-coverage_factor = min(executed / executable, 1.0)   # the DISCOUNT — flakes/crashes only
-executed_ratio  = executed / attempted              # the GATE — how much of the suite ran at all
+executable = attempted − na_structural
+coverage   = min(executed / executable, 1.0)     # executable > 0
 ```
 
-- **coverage_factor** (discount) never penalises structural gaps: it is 1.0 in
-  a clean run and drops only when runnable checks flake/crash.
-- **No 0.5 floor** (removed). Instead an **evidence gate** on the absolute
-  fraction executed: if `attempted == 0` OR `executed_ratio < 0.33` →
-  **Mobile = None** ("insufficient coverage to score"). This is a binary
-  "enough evidence to publish a number?" check, not a proportional penalty, so
-  it also catches the degenerate case where almost everything was structurally
-  impossible — publishing a confident single score on a sliver of the suite
-  would mislead regardless of fault. This run: Chromium `executed_ratio` 1.00,
-  WebKit 144/216 = 0.67 — both clear the gate.
+- **Structural N/A excluded from `executable`** — an engine is never
+  penalised for CDP-gated checks it cannot run; those are reported separately
+  as N/A gaps and touch neither the gate nor the discount denominator.
+- **coverage never drops for structural reasons** — it is 1.0 in a clean run
+  and falls only when *runnable* checks flake or crash.
+- **No 0.5 floor.** A single coverage metric both gates and discounts:
+  - **Gate:** `executable == 0` OR `coverage < 0.33` → **Mobile = None**,
+    marked "insufficient coverage to score" (never a partial score). Same
+    honesty as v2's "not measured", not a fabricated discounted number.
+  - **Discount:** otherwise `Mobile = round(Quality × coverage)`.
+- Two separate denominators (a prior draft) collapse to this one anyway once
+  structural is excluded from both, so a single metric is kept. The
+  "almost-everything-structural" thinness case is not separately gated; it is a
+  non-scenario with current engines (WebKit is 144/216 = 67% executable) and
+  can be revisited if a future engine is that limited. This run: Chromium
+  `coverage` 216/216 = 1.00, WebKit 144/144 = 1.00 — both clear the gate.
 - **Why hybrid:** penalising WebKit for CDP-impossible checks mixes product
   quality with test-framework capability and makes the score misleading. An
   engine is judged only on what it *can* run; structural gaps are surfaced as
@@ -116,8 +122,8 @@ executed_ratio  = executed / attempted              # the GATE — how much of t
 - **chromium**: 75 patterns, Σ≈57.9, ceiling 100 → Quality 62; executable
   216/216 → coverage 1.0 → **Mobile 62**.
 - **webkit**: 86 patterns, Σ≈62.4, ceiling 100 → Quality 59; 72 gaps are
-  **all structural** (h_pan/scroll/sticky/network, 0 crashes) → executable
-  144/144 → coverage 1.0 → **Mobile 59**.
+  **all structural** (h_pan/scroll/sticky/network, 0 crashes) → executable =
+  216 − 72 = 144, coverage 144/144 = 1.0 → **Mobile 59**.
 - The earlier multiplicative model gave WebKit 39 — that drop was purely the
   CDP-impossible checks, i.e. the exact product-vs-capability confusion the
   hybrid removes. Chromium (62) and WebKit (59) now differ only by their small
@@ -181,11 +187,11 @@ notices / 0 crashes, so the split is well-defined on real data.
 
 - Curve discrimination: 20-pattern vs 86-pattern runs score apart.
 - Severity ceilings: one major → ≤55; one blocker → ≤20 regardless of volume.
-- Hybrid coverage: structural gaps do NOT discount (WebKit-shaped input →
-  coverage 1.0); non-structural crashes DO discount.
-- Evidence gate: `attempted == 0` → None; `executed_ratio` (executed/attempted)
-  < 0.33 → None. Discount (coverage_factor = executed/executable) is separate
-  and never triggered by structural gaps.
+- Coverage metric: structural gaps do NOT reduce `coverage` (WebKit-shaped
+  input, 0 crashes → coverage 1.0); non-structural crashes DO reduce it.
+- Gate: `executable == 0` → None; `coverage < 0.33` → None (marked insufficient
+  coverage, never a partial score). Structural N/A excluded from `executable`,
+  so it drives neither the gate nor the discount.
 - No-mobile run: v3 overall == v1 overall (renormalisation identity).
 - Trend chart: `mobile_health is None` entries are skipped, never plotted as 0.
 - `scoring_version == 3` stamped on result and trend entry; v2 history
