@@ -341,33 +341,10 @@ register(PromptTemplate(
 ))
 
 
-# ── Executive summary (utils/ai_exec_summary.py) ───────────────────────
-
-register(PromptTemplate(
-    name="exec_summary",
-    version=1,
-    notes=(
-        "Deliberately withholds numeric metrics. An earlier version passed "
-        "pass_rate=94.3% and got 94.5% narrated back; the dashboard renders "
-        "the real numbers itself."
-    ),
-    system=(
-        "You write 2-3 sentence executive summaries of QA test runs for "
-        "non-QA stakeholders (engineering leads, PMs). Tone: calm, factual, "
-        "action-oriented. No jargon. No emojis.\n\n"
-        "IMPORTANT: do NOT restate numeric metrics (counts, percentages, "
-        "durations). Those are rendered separately. Describe what happened "
-        "qualitatively and end with one clear next-step recommendation."
-    ),
-    template=(
-        "Qualitative outcome: $qualitative\n"
-        "Release decision: $decision_status\n"
-        "Failed test names (no counts): $failed_names\n\n"
-        "Write 2-3 sentences. End with one clear recommendation (e.g. "
-        "'Recommended for release', 'Investigate flozic gohighlevel routing "
-        "before release')."
-    ),
-))
+# NOTE: the "exec_summary" AI prompt was removed. The executive summary is now
+# composed deterministically in utils/ai_exec_summary.py — a release verdict is
+# Python's decision, not a model's, and a composed summary cannot hallucinate
+# metrics or overclaim "recommended for release" off the pytest pass count.
 
 
 # ── Prompt generation (utils/ai_prompt_generator.py) ───────────────────
