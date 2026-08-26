@@ -774,6 +774,19 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> objec
         or looks_like_connectivity_loss(str(call.excinfo.value))
     ):
         setattr(item, "harness_fault", True)
+
+    # Stash the REAL failure signature (ExceptionType: message). call.excinfo is
+    # the only place the exception itself is available — by teardown, longrepr's
+    # first line is 'self = <TestClass object>', which would cluster failures by
+    # test class rather than by cause. exconly() is class-agnostic, so the same
+    # cause in different test classes shares a signature. Keep the first failing
+    # phase (setup fires before call); never let a teardown error overwrite it.
+    if call.excinfo is not None and rep.failed and not getattr(item, "_error_signature", ""):
+        try:
+            sig = call.excinfo.exconly(tryshort=True)
+        except Exception:
+            sig = str(call.excinfo.value)
+        setattr(item, "_error_signature", " ".join(sig.split())[:300])
     return rep
 
 
@@ -890,17 +903,20 @@ def _record_outcome(
     if _engine != "chromium":
         cohort = f"{cohort}-{_engine}"
 
-    # Failure signature: first line of the failing rep's longrepr (the
-    # assertion / exception line). Persisted so cross-run + within-run SYSTEMIC
-    # clustering can group by normalized signature, not by feature name.
-    error_signature = ""
-    if failed:
+    # Failure signature = the exception (ExceptionType: message) stashed by the
+    # makereport hook from call.excinfo. Persisted so SYSTEMIC clustering groups
+    # by CAUSE, not by test class. Fallback: scan longrepr for the pytest 'E '
+    # exception line (NOT line 0, which is 'self = <object>').
+    error_signature = getattr(request.node, "_error_signature", "") or ""
+    if failed and not error_signature:
         for phase in ("rep_call", "rep_setup"):
             _r = getattr(request.node, phase, None)
             if _r is not None and _r.failed and getattr(_r, "longrepr", None):
-                lines = [ln for ln in str(_r.longrepr).splitlines() if ln.strip()]
-                if lines:
-                    error_signature = lines[0][:300]
+                elines = [ln.lstrip("E ").strip()
+                          for ln in str(_r.longrepr).splitlines()
+                          if ln.lstrip().startswith("E ")]
+                if elines:
+                    error_signature = elines[-1][:300]
                     break
 
     add_test_record(
