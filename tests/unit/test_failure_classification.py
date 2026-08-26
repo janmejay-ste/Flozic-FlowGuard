@@ -58,3 +58,47 @@ def test_build_clusters_labels_new_vs_flaky(tmp_path):
     assert clusters["test_flaky"].label == "FLAKY"
     assert clusters["test_flaky"].occurrences_in_history == 3
     assert clusters["test_flaky"].passes_in_history == 2
+
+
+# ── Systemic detection: signature must MATCH, not just share a feature ──────
+
+def _fr(method, sig, feature="F", engine="chromium"):
+    return {"method": method, "feature": feature, "errorSignature": sig,
+            "engine": engine, "status": "FAIL"}
+
+
+def test_systemic_groups_by_normalized_signature():
+    # Three independent tests, signatures differ only in the duration number →
+    # same normalized signature → one systemic failure.
+    recs = [
+        _fr("t1", "TimeoutError: waiting for 'Connect created' after 180000ms"),
+        _fr("t2", "TimeoutError: waiting for 'Connect created' after 45000ms"),
+        _fr("t3", "TimeoutError: waiting for 'Connect created' after 90000ms"),
+    ]
+    out = fc.detect_systemic(recs, min_tests=3)
+    assert len(out) == 1
+    assert out[0].affected_tests == 3
+
+
+def test_systemic_excludes_feature_fallback_signatures():
+    # 'feature=' is the pre-signature fallback — NEVER systemic (this is the
+    # rule that stops systemic from decaying into feature concentration).
+    recs = [_fr(f"t{i}", "feature=Flozic Entry Point") for i in range(5)]
+    assert fc.detect_systemic(recs, min_tests=3) == []
+
+
+def test_systemic_requires_independent_tests_not_repeats_of_one():
+    recs = [_fr("same_test", "AssertionError: dashboard did not load in time") for _ in range(5)]
+    assert fc.detect_systemic(recs, min_tests=3) == []   # 5 records, 1 method
+
+
+def test_systemic_below_threshold_not_flagged():
+    recs = [_fr("t1", "SomeError: a specific and long failure message"),
+            _fr("t2", "SomeError: a specific and long failure message")]
+    assert fc.detect_systemic(recs, min_tests=3) == []   # only 2 independent
+
+
+def test_systemic_confidence_scales_with_independent_tests():
+    recs = [_fr(f"t{i}", "AssertionError: dashboard did not load in time") for i in range(8)]
+    out = fc.detect_systemic(recs, min_tests=3)
+    assert out and out[0].confidence == "High" and out[0].affected_tests == 8

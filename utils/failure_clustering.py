@@ -113,14 +113,13 @@ def _occurrence_from_record(
     method  = record.get("method") or record.get("name") or "<unknown>"
     feat    = record.get("feature", "")
     cat     = record.get("category", "")
-    # The snapshot doesn't store the exception text by design. We use the
-    # test method name + the artifact_folder timestamp as a coarse signal.
-    # The dashboard's ai_triage.json (when present) would give a richer
-    # message, but for cross-run clustering we want a stable signal that's
-    # present in EVERY snapshot — so we stick to the test name + feature.
-    # If two distinct exceptions in the same test happen, they'll cluster
-    # together; that's acceptable for v1.
-    message = f"feature={feat}"
+    # Prefer the persisted failure signature (first line of the assertion /
+    # exception) when the snapshot carries one — that lets two failures that
+    # differ only in dynamic content share a fingerprint. Older snapshots
+    # (pre-signature) have no errorSignature; fall back to the feature name so
+    # they still cluster coarsely rather than not at all.
+    sig = record.get("errorSignature") or ""
+    message = sig if sig else f"feature={feat}"
     return FailureOccurrence(
         run_id=run_id,
         test_method=method,
@@ -335,6 +334,100 @@ def build_clusters(
 
     clusters.sort(key=lambda c: c.recurring_score, reverse=True)
     return clusters
+
+
+@dataclass
+class SystemicFailure:
+    """A set of INDEPENDENT failing tests whose NORMALIZED failure signatures
+    match — evidence of one common cause, not merely the same feature.
+
+    Deliberately distinct from two weaker signals (do not conflate them):
+      * Failure Concentration = many failures in the same FEATURE (unproven cause)
+      * Failure Cluster       = failures sharing a normalized signature
+      * Systemic Failure      = a cluster with ENOUGH INDEPENDENT tests to be
+                                high-confidence one cause
+    """
+    signature: str                       # normalized signature (the join key)
+    sample_message: str                  # a representative raw first line
+    affected_tests: int                  # distinct test methods
+    features: int                        # distinct features spanned
+    engines: list[str] = field(default_factory=list)
+    confidence: str = "Low"              # High | Medium | Low
+    test_methods: list[str] = field(default_factory=list)
+    sample_features: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# A signature must be a REAL error line to qualify for systemic detection —
+# never the "feature=" fallback used for pre-signature snapshots, and long
+# enough to be specific rather than generic noise.
+def _is_real_signature(raw: str) -> bool:
+    return bool(raw) and not raw.startswith("feature=") and len(raw.strip()) >= 12
+
+
+def _systemic_confidence(affected_tests: int, features: int) -> str:
+    """Confidence that a matching-signature cluster is ONE systemic cause.
+    Driven by how many INDEPENDENT tests share the signature (and, secondarily,
+    how widely it spreads across features) — NOT by feature membership."""
+    if affected_tests >= 8 or (affected_tests >= 5 and features >= 2):
+        return "High"
+    if affected_tests >= 4:
+        return "Medium"
+    return "Low"
+
+
+def detect_systemic(
+    fail_records: Iterable[dict],
+    min_tests: int = 3,
+) -> list[SystemicFailure]:
+    """Group this run's FAIL records by NORMALIZED signature and return the
+    groups that look systemic: a real (non-fallback) signature shared by at
+    least `min_tests` DISTINCT test methods.
+
+    `fail_records`: dicts with keys method, feature, errorSignature, and
+    (optionally) engine. Records without a real signature are EXCLUDED — a
+    common cause cannot be claimed without matching signatures, which is the
+    rule that keeps this from degenerating back into feature concentration.
+    """
+    groups: dict[str, dict] = {}
+    for r in fail_records:
+        if r.get("status") not in (None, "FAIL"):
+            continue
+        raw = r.get("errorSignature") or ""
+        if not _is_real_signature(raw):
+            continue
+        sig = normalize_message(raw)
+        g = groups.setdefault(sig, {
+            "methods": set(), "features": set(), "engines": set(),
+            "raw_counts": {},
+        })
+        g["methods"].add(r.get("method") or "")
+        if r.get("feature"):
+            g["features"].add(r["feature"])
+        if r.get("engine"):
+            g["engines"].add(r["engine"])
+        g["raw_counts"][raw] = g["raw_counts"].get(raw, 0) + 1
+
+    out: list[SystemicFailure] = []
+    for sig, g in groups.items():
+        methods = {m for m in g["methods"] if m}
+        if len(methods) < min_tests:
+            continue
+        sample = max(g["raw_counts"].items(), key=lambda kv: kv[1])[0] if g["raw_counts"] else sig
+        out.append(SystemicFailure(
+            signature=sig,
+            sample_message=sample,
+            affected_tests=len(methods),
+            features=len(g["features"]),
+            engines=sorted(g["engines"]),
+            confidence=_systemic_confidence(len(methods), len(g["features"])),
+            test_methods=sorted(methods),
+            sample_features=sorted(g["features"]),
+        ))
+    out.sort(key=lambda s: s.affected_tests, reverse=True)
+    return out
 
 
 def cluster_for_test(

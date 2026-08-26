@@ -125,6 +125,7 @@ def _records_from_snapshot(path: str) -> tuple[list[TestRecord], int | None]:
             cohort=t.get("cohort", "baseline"),
             video_path=t.get("videoPath"),
             harness_fault=bool(t.get("harnessFault", False)),
+            error_signature=t.get("errorSignature", ""),
         ))
     return recs, d.get("timestamp")
 
@@ -459,9 +460,10 @@ def _render_combined_issues(engines: list[EngineData]) -> str:
 
 
 def _render_systemic(engines: list[EngineData]) -> str:
-    """v1 systemic proxy: failures concentrated in one feature within a run.
-    (Exception-signature grouping needs exception text, which v3 snapshots do
-    not persist — flagged so the label is honest.)"""
+    """FAILURE CONCENTRATION — many failures in the same FEATURE. This is the
+    WEAKEST of the three signals and does NOT claim a common cause: 27 failures
+    in one feature could be 10 backend + 8 selector + 5 data + 4 product. For a
+    proven common cause see the Systemic Failures section (signature-matched)."""
     blocks = []
     for ed in engines:
         by_feat: dict[str, int] = {}
@@ -477,11 +479,74 @@ def _render_systemic(engines: list[EngineData]) -> str:
         )
         blocks.append(f"<div class='sysblk'>{_prov(ed.engine, ed.run_label)}<ul>{items}</ul></div>")
     if not blocks:
-        return "<p class='muted'>No feature shows a failure cluster (≥3) this run.</p>"
+        return "<p class='muted'>No feature has ≥3 failures this run.</p>"
     return (
-        "<p class='note'>Failure concentration by feature (a suspected common cause). "
-        "v1 groups by feature; exception-signature grouping arrives once snapshots persist "
-        "the normalized error text.</p>" + "".join(blocks)
+        "<p class='note'><strong>Concentration ≠ common cause.</strong> This groups failures by "
+        "FEATURE only — it does not prove they share a root cause. Signature-matched grouping is in "
+        "the Systemic Failures section below.</p>" + "".join(blocks)
+    )
+
+
+def _render_systemic_failures(engines: list[EngineData]) -> str:
+    """SYSTEMIC FAILURES — independent tests whose NORMALIZED failure signatures
+    MATCH (a proven common cause), computed by failure_clustering.detect_systemic.
+    Distinct from Failure Concentration: membership requires a matching real
+    signature, never mere feature co-location."""
+    from utils.failure_clustering import detect_systemic
+
+    fail_records: list[dict] = []
+    signed = 0
+    for ed in engines:
+        for r in ed.records:
+            if r.status != "FAIL":
+                continue
+            sig = getattr(r, "error_signature", "") or ""
+            if sig:
+                signed += 1
+            fail_records.append({
+                "method": f"{r.clazz}::{r.method}", "feature": r.feature,
+                "errorSignature": sig, "engine": ed.engine, "status": "FAIL",
+            })
+
+    if signed == 0:
+        return (
+            "<div class='pending'>⏳ <strong>Systemic detection pending.</strong> No failing test in "
+            "the persisted runs carries a normalized error signature yet — signatures are captured from "
+            "runs made after this feature landed. Re-run the suite so failures persist "
+            "<code>errorSignature</code>, then this section groups independent tests by matching "
+            "signature. (Until then, see Failure Concentration for the weaker feature-level view.)</div>"
+        )
+
+    systemic = detect_systemic(fail_records, min_tests=3)
+    if not systemic:
+        return (
+            f"<p class='muted'>No systemic failure detected: {signed} failing test(s) carry signatures, "
+            "but no signature is shared by ≥3 independent tests. (Feature concentration, a weaker signal, "
+            "may still appear above.)</p>"
+        )
+
+    conf_color = {"High": "#b91c1c", "Medium": "#92400e", "Low": "#64748b"}
+    cards = []
+    for s in systemic:
+        col = conf_color.get(s.confidence, "#64748b")
+        methods = "".join(f"<li><code>{esc(m)}</code></li>" for m in s.test_methods[:30])
+        if len(s.test_methods) > 30:
+            methods += f"<li class='muted'>+{len(s.test_methods) - 30} more</li>"
+        cards.append(
+            "<div class='sysfail'>"
+            f"<div class='sysfail-head'><span class='sysfail-sig'>“{esc(s.sample_message[:120])}”</span>"
+            f"<span class='sysfail-conf' style='color:{col};border-color:{col}'>{esc(s.confidence)} confidence</span></div>"
+            f"<div class='sysfail-stats'>"
+            f"<span><strong>{s.affected_tests}</strong> independent tests</span>"
+            f"<span><strong>{s.features}</strong> feature(s)</span>"
+            f"<span>engines: {esc(', '.join(s.engines) or '—')}</span></div>"
+            f"<details class='drill'><summary>affected tests</summary><ul>{methods}</ul></details>"
+            "</div>"
+        )
+    return (
+        "<p class='note'>Independent tests whose <strong>normalized failure signatures match</strong> — "
+        "evidence of one common cause, not just shared features. Confidence scales with the number of "
+        "independent tests sharing the signature.</p>" + "".join(cards)
     )
 
 
@@ -694,6 +759,12 @@ td.eng{white-space:nowrap}
 .cmp-box h3{font-size:12px;margin-bottom:6px}.cmp-box small{color:#94a3b8;font-weight:600}
 .cmp-box ul{list-style:none;max-height:220px;overflow:auto}.cmp-box li{padding:2px 0;font-size:12px;border-bottom:1px solid #f1f5f9}
 .sysblk{margin-bottom:10px}.sysblk ul{list-style:none;margin-top:6px}.sysblk li{padding:2px 0}
+.sysfail{border:1px solid #fecaca;background:#fef2f2;border-radius:10px;padding:12px;margin-bottom:10px}
+.sysfail-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
+.sysfail-sig{font-family:ui-monospace,Menlo,monospace;font-size:13px;font-weight:700;color:#7f1d1d}
+.sysfail-conf{font-size:11px;font-weight:800;border:1px solid;border-radius:999px;padding:1px 8px}
+.sysfail-stats{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:#64748b;margin:6px 0}
+.sysfail details{margin-top:4px}.sysfail ul{list-style:none;max-height:180px;overflow:auto}.sysfail li{padding:1px 0;font-size:12px}
 .rel{display:inline-block;margin-top:4px;font-size:10px;font-weight:800;padding:1px 8px;border-radius:6px}
 .rel-blocked{background:#fee2e2;color:#b91c1c}.rel-ready{background:#dcfce7;color:#15803d}
 .rel-warning,.rel-at_risk{background:#fef3c7;color:#92400e}.rel-inconclusive{background:#e0e7ff;color:#3730a3}
@@ -762,6 +833,7 @@ def build(base: str = "reports/trend", out: Path | str = OUT_PATH) -> Path:
     sections = "".join([
         _section("sec-exec", "Executive Summary", _render_exec_summary(engines)),
         _section("sec-systemic", "Cross-Engine · Failure Concentration", _render_systemic(engines)),
+        _section("sec-systemic-failures", "Cross-Engine · Systemic Failures", _render_systemic_failures(engines)),
         _section("sec-recurring", "Cross-Engine · Failure History",
                  _render_recurring(base), _prov("chromium", chromium.run_label, "run history")),
         _section("sec-login", "Cross-Engine · 🔐 Login Route Observations",

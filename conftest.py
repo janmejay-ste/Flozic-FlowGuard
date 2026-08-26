@@ -890,6 +890,19 @@ def _record_outcome(
     if _engine != "chromium":
         cohort = f"{cohort}-{_engine}"
 
+    # Failure signature: first line of the failing rep's longrepr (the
+    # assertion / exception line). Persisted so cross-run + within-run SYSTEMIC
+    # clustering can group by normalized signature, not by feature name.
+    error_signature = ""
+    if failed:
+        for phase in ("rep_call", "rep_setup"):
+            _r = getattr(request.node, phase, None)
+            if _r is not None and _r.failed and getattr(_r, "longrepr", None):
+                lines = [ln for ln in str(_r.longrepr).splitlines() if ln.strip()]
+                if lines:
+                    error_signature = lines[0][:300]
+                    break
+
     add_test_record(
         category=category,
         login=login,
@@ -902,4 +915,5 @@ def _record_outcome(
         video_path=video_path,
         cohort=cohort,
         harness_fault=bool(getattr(request.node, "harness_fault", False)),
+        error_signature=error_signature,
     )
