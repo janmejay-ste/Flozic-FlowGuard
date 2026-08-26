@@ -1715,6 +1715,26 @@ def _render(
     login_routes_html = _render_login_routes_section()
     browser_tabs_html = _render_browser_tabs()
 
+    # Prominent link to the combined cross-engine (Hybrid) report. It always
+    # lives at reports/trend/combined-report.html; compute a relative href from
+    # THIS engine's dashboard location (chromium: sibling; webkit: ../).
+    import os as _os
+    try:
+        _combined_href = _os.path.relpath(
+            Path("reports/trend/combined-report.html"), DASHBOARD_PATH.parent)
+    except Exception:
+        _combined_href = "combined-report.html"
+    combined_banner = (
+        f"<a href='{_combined_href}' class='no-print' "
+        "style='display:block;margin-bottom:20px;padding:12px 18px;border-radius:10px;"
+        "background:linear-gradient(90deg,#eef2ff,#faf5ff);border:1px solid #c7d2fe;"
+        "color:#3730a3;font-weight:700;font-size:14px;text-decoration:none'>"
+        "📊 Open the Combined Cross-Engine Report (Chromium + WebKit, Hybrid layout) &rarr;"
+        "<span style='display:block;font-weight:500;font-size:12px;color:#6366f1;margin-top:2px'>"
+        "This per-engine dashboard shows one engine; the combined report cross-references both with "
+        "provenance, an engine-comparison matrix, and per-section PDF export.</span></a>"
+    )
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1898,6 +1918,8 @@ def _render(
       </div>
     </div>
   </div>
+
+  {combined_banner}
 
   <!-- Browser tabs (chromium / firefox / webkit) — only shown when
        multiple per-browser dashboards exist on disk. -->
