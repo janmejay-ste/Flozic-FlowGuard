@@ -179,30 +179,31 @@ def _status_badge(status: str) -> str:
     )
 
 
-def _recurring_badge(occurrences: int, window: int, score: float) -> str:
-    """
-    Pill-style recurring-failure badge: '🔁 5/30'. Colour heat-mapped by score.
+# Icon + colour per failure-history label (min-observation classification).
+_LABEL_STYLE = {
+    "NEW":                ("🆕", "#0369a1", "#dbeafe"),
+    "OBSERVED":           ("👁", "#0369a1", "#dbeafe"),
+    "RECURRING":          ("🔁", "#92400e", "#fef3c7"),
+    "FLAKY":              ("⚠️", "#7c3aed", "#ede9fe"),
+    "CONSISTENT_FAILURE": ("🔁", "#b91c1c", "#fee2e2"),
+}
 
-    Score band -> colour:
-      < 0.05      hidden (one-off, not interesting)
-      0.05–0.20   blue   (occasional)
-      0.20–0.50   amber  (recurring, watch)
-      ≥ 0.50      red    (chronic — needs intervention)
+
+def _recurring_badge(occurrences: int, window: int, score: float,
+                     label: str = "NEW") -> str:
+    """Failure-history badge, e.g. '🆕 NEW 1/30' or '🔁 RECURRING 4/30'.
+
+    Classification (not score) decides the word: a failure seen once is NEW,
+    never 'recurring'. Shown for every classified failure so a one-off reads
+    honestly as new rather than as an established pattern.
     """
-    if score < 0.05:
-        return ""
-    color, bg = (
-        ("#b91c1c", "#fee2e2") if score >= 0.50 else
-        ("#92400e", "#fef3c7") if score >= 0.20 else
-        ("#0369a1", "#dbeafe")
-    )
+    icon, color, bg = _LABEL_STYLE.get(label, _LABEL_STYLE["NEW"])
     return (
         f"<span style='display:inline-block;padding:2px 8px;border-radius:9999px;"
         f"font-size:11px;font-weight:700;background:{bg};color:{color};"
         f"margin-left:8px;vertical-align:middle;' "
-        f"title='Recurring failure: seen in {occurrences}/{window} runs "
-        f"(score {score:.2f})'>"
-        f"🔁 {occurrences}/{window}</span>"
+        f"title='{label}: failed in {occurrences}/{window} runs (score {score:.2f})'>"
+        f"{icon} {label} {occurrences}/{window}</span>"
     )
 
 
@@ -516,6 +517,7 @@ def _render_test_rows(
                 cluster.occurrences_in_history,
                 cluster.window_size,
                 cluster.recurring_score,
+                getattr(cluster, "label", "NEW"),
             )
         ai_details = _ai_details_block(r)
         # data-* attributes drive the client-side filter / search / sort.
@@ -1509,15 +1511,20 @@ def _render_recurring_failures_section(clusters) -> str:
     visible = [c for c in clusters if c.recurring_score >= 0.05]
     if not visible:
         return ""
+    # Established patterns (RECURRING/FLAKY/CONSISTENT/OBSERVED) first, NEW last —
+    # so a wall of one-off NEW failures never buries a real recurring bug.
+    _order = {"CONSISTENT_FAILURE": 0, "RECURRING": 1, "FLAKY": 2, "OBSERVED": 3, "NEW": 4}
+    visible = sorted(visible, key=lambda c: (_order.get(getattr(c, "label", "NEW"), 5),
+                                             -c.recurring_score))
+    from collections import Counter
+    counts = Counter(getattr(c, "label", "NEW") for c in visible)
+    summary = " · ".join(f"{n} {lbl.replace('_', ' ').title()}"
+                         for lbl, n in sorted(counts.items(), key=lambda kv: _order.get(kv[0], 5)))
     rows = []
     for c in visible[:20]:  # cap at top 20 to keep the page bounded
-        # Pill colour mirrors _recurring_badge
-        score = c.recurring_score
-        color, bg = (
-            ("#b91c1c", "#fee2e2") if score >= 0.50 else
-            ("#92400e", "#fef3c7") if score >= 0.20 else
-            ("#0369a1", "#dbeafe")
-        )
+        label = getattr(c, "label", "NEW")
+        icon, color, bg = _LABEL_STYLE.get(label, _LABEL_STYLE["NEW"])
+        passes = getattr(c, "passes_in_history", 0)
         rows.append(
             "<tr>"
             f"<td style='padding:6px 12px;font-family:monospace;font-size:12px'>{c.sample_method}</td>"
@@ -1525,8 +1532,10 @@ def _render_recurring_failures_section(clusters) -> str:
             f"<td style='padding:6px 12px;text-align:center;font-size:12px'>"
             f"<span style='display:inline-block;padding:2px 8px;border-radius:9999px;"
             f"font-size:11px;font-weight:700;background:{bg};color:{color}'>"
-            f"{c.occurrences_in_history}/{c.window_size}</span></td>"
-            f"<td style='padding:6px 12px;text-align:right;font-size:12px;color:#64748b'>{score:.2f}</td>"
+            f"{icon} {label.replace('_', ' ')}</span></td>"
+            f"<td style='padding:6px 12px;text-align:center;font-size:12px;color:#64748b'>"
+            f"{c.occurrences_in_history} fail / {passes} pass of {c.runs_seen or c.window_size} runs</td>"
+            f"<td style='padding:6px 12px;text-align:right;font-size:12px;color:#64748b'>{c.recurring_score:.2f}</td>"
             f"<td style='padding:6px 12px;font-size:11px;color:#94a3b8'>{c.last_seen}</td>"
             "</tr>"
         )
@@ -1535,13 +1544,16 @@ def _render_recurring_failures_section(clusters) -> str:
     <div class="dark-surface" style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;
                 padding:18px 22px;margin-bottom:20px;">
       <div style="display:flex;align-items:baseline;justify-content:space-between;
-                  margin-bottom:10px;">
+                  margin-bottom:6px;">
         <div style="font-size:14px;font-weight:700;color:#1e293b;">
-          🔁 Recurring Failures
+          🔁 Failure History
         </div>
         <div style="font-size:11px;color:#64748b;">
-          ranked by recency-weighted score · last {visible[0].window_size} runs
+          last {visible[0].window_size} runs · {summary}
         </div>
+      </div>
+      <div style="font-size:11px;color:#94a3b8;margin-bottom:10px;">
+        NEW = failed once · OBSERVED = twice · RECURRING = 3+ · FLAKY = passes and fails · CONSISTENT = fails ≥90%
       </div>
       <table style="width:100%;border-collapse:collapse;">
         <thead>
@@ -1551,7 +1563,9 @@ def _render_recurring_failures_section(clusters) -> str:
             <th style='padding:6px 12px;text-align:left;font-size:11px;color:#64748b;
                        font-weight:600;text-transform:uppercase;letter-spacing:0.5px'>Feature</th>
             <th style='padding:6px 12px;text-align:center;font-size:11px;color:#64748b;
-                       font-weight:600;text-transform:uppercase;letter-spacing:0.5px'>Runs</th>
+                       font-weight:600;text-transform:uppercase;letter-spacing:0.5px'>Type</th>
+            <th style='padding:6px 12px;text-align:center;font-size:11px;color:#64748b;
+                       font-weight:600;text-transform:uppercase;letter-spacing:0.5px'>History</th>
             <th style='padding:6px 12px;text-align:right;font-size:11px;color:#64748b;
                        font-weight:600;text-transform:uppercase;letter-spacing:0.5px'>Score</th>
             <th style='padding:6px 12px;text-align:left;font-size:11px;color:#64748b;

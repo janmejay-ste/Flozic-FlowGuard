@@ -179,9 +179,67 @@ class FailureCluster:
     window_size: int = 0          # how many runs were in the window
     recurring_score: float = 0.0  # 0..1, recency-weighted occurrence rate
     sample_message: str = ""
+    # Classification (min-observation rule). A failure seen once is NEW, not
+    # "recurring" — calling a 1/30 failure recurring is exactly the bug this
+    # field fixes. runs_seen / passes_in_history come from the test method's
+    # full pass+fail history and let us distinguish FLAKY from CONSISTENT.
+    runs_seen: int = 0            # runs (in window) where the test method ran at all
+    passes_in_history: int = 0    # runs where the method PASSED
+    label: str = "NEW"            # NEW | OBSERVED | RECURRING | FLAKY | CONSISTENT_FAILURE
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def classify_failure(fail_runs: int, runs_seen: int, passed_runs: int) -> str:
+    """Minimum-observation classification for a failing test.
+
+    1 failure  -> NEW               (a one-off; never call this 'recurring')
+    2 failures -> OBSERVED          (seen twice; still not established)
+    3+ failures:
+        also passed somewhere       -> FLAKY   (mixed pass/fail history)
+        fails >=90% of runs seen    -> CONSISTENT_FAILURE
+        otherwise                   -> RECURRING
+    """
+    if fail_runs <= 1:
+        return "NEW"
+    if fail_runs == 2:
+        return "OBSERVED"
+    if passed_runs >= 1:
+        return "FLAKY"
+    if runs_seen > 0 and fail_runs / runs_seen >= 0.9:
+        return "CONSISTENT_FAILURE"
+    return "RECURRING"
+
+
+def _method_run_stats(snapshot_dir: Path, last_n: int) -> dict[str, dict[str, int]]:
+    """Per test-method appearance stats across the window: how many runs it ran
+    in (seen), passed in, and failed in. Feeds FLAKY vs CONSISTENT_FAILURE."""
+    if not snapshot_dir.exists():
+        return {}
+    files = sorted(snapshot_dir.glob("*.json"), reverse=True)[:last_n]
+    acc: dict[str, dict[str, set]] = {}
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        run_id = f.stem
+        for r in (data.get("tests") or data.get("records") or []):
+            m = r.get("method") or r.get("name")
+            if not m:
+                continue
+            s = acc.setdefault(m, {"seen": set(), "passed": set(), "failed": set()})
+            s["seen"].add(run_id)
+            st = r.get("status")
+            if st == "PASS":
+                s["passed"].add(run_id)
+            elif st == "FAIL":
+                s["failed"].add(run_id)
+    return {
+        m: {"seen": len(v["seen"]), "passed": len(v["passed"]), "failed": len(v["failed"])}
+        for m, v in acc.items()
+    }
 
 
 def _recurring_score(
@@ -249,21 +307,30 @@ def build_clusters(
             entry["run_ids"].append(run_id)
 
     window_size = len(history)
+    mstats = _method_run_stats(snapshot_dir, last_n)
     clusters: list[FailureCluster] = []
     for fp, entry in accum.items():
         indices = entry["indices"]
         run_ids = entry["run_ids"]
+        method = entry["sample_method"]
+        ms = mstats.get(method, {})
+        fail_runs = len(indices)
+        runs_seen = ms.get("seen", fail_runs)
+        passed_runs = ms.get("passed", 0)
         clusters.append(FailureCluster(
             fingerprint=fp,
-            sample_method=entry["sample_method"],
+            sample_method=method,
             sample_feature=entry["sample_feature"],
             sample_message=entry["sample_message"],
             first_seen=run_ids[-1],   # oldest because history is newest-first
             last_seen=run_ids[0],
-            occurrences_in_history=len(indices),
+            occurrences_in_history=fail_runs,
             occurrence_runs=list(reversed(run_ids)),  # chronological
             window_size=window_size,
             recurring_score=_recurring_score(indices, window_size),
+            runs_seen=runs_seen,
+            passes_in_history=passed_runs,
+            label=classify_failure(fail_runs, runs_seen, passed_runs),
         ))
 
     clusters.sort(key=lambda c: c.recurring_score, reverse=True)
