@@ -268,6 +268,21 @@ def _eligibility(engines: list[EngineData]) -> str:
     return "Full" if suites == {"full"} else "Partial"
 
 
+def _release_reason(engines: list[EngineData], overall: str) -> str:
+    """Explain the release verdict by naming the run that drove it, rather than
+    the terse 'worst engine decision'. Prefer a full-suite driver."""
+    drivers = [ed for ed in engines
+               if str((ed.auth or {}).get("status", "")).upper() == overall]
+    full_driver = next((ed for ed in drivers if _is_full(ed.auth)), None)
+    if full_driver:
+        return (f"the full-suite {full_driver.engine} run is {overall}; "
+                "partial-scope coverage on other engines cannot override a full-suite decision")
+    if drivers:
+        return (f"{drivers[0].engine} is {overall} (no full-suite run to override it — "
+                "treat this as provisional until a full suite runs)")
+    return "no completed run to decide from"
+
+
 def _render_exec_summary(engines: list[EngineData]) -> str:
     overall = _overall_release(engines)
     cards = []
@@ -304,8 +319,8 @@ def _render_exec_summary(engines: list[EngineData]) -> str:
     )
     return (
         f"<div class='rel-banner rel-{overall.lower()}'>RELEASE: {esc(overall)}"
-        f"<span class='rel-why'>overall = worst engine decision — a full-suite BLOCK blocks release; "
-        f"a partial-scope pass cannot lift it</span></div>"
+        f"<span class='rel-why'>Release decision = {esc(overall)} because "
+        f"{esc(_release_reason(engines, overall))}.</span></div>"
         f"<div class='eng-cards'>{''.join(cards)}</div>"
         f"{warn}"
         "<p class='note'>Product / Infra / Framework per engine are shown in the per-engine sections below, "
@@ -341,6 +356,12 @@ def _render_engine_comparison(chromium: EngineData, webkit: EngineData) -> str:
     webkit_only_exec = len(w_run - c_run)
     not_comparable = len(chromium_notrun) + len(webkit_notrun)
     elig = _eligibility([chromium, webkit])
+    _cexe = ((chromium.mobile or {}).get("check_stats") or {}).get("executed")
+    _wexe = ((webkit.mobile or {}).get("check_stats") or {}).get("executed")
+    comparable_mobile = min(_cexe, _wexe) if isinstance(_cexe, int) and isinstance(_wexe, int) else None
+    _basis = f"{comparable_exec} co-executed test(s)"
+    if comparable_mobile:
+        _basis += f" + {comparable_mobile} comparable mobile check(s)"
 
     def _lst(items: list[tuple[str, str]]) -> str:
         if not items:
@@ -353,6 +374,7 @@ def _render_engine_comparison(chromium: EngineData, webkit: EngineData) -> str:
     return f"""
 <div class='elig elig-{elig.lower()}'>Comparison eligibility: <strong>{elig}</strong>
 {'' if elig == 'Full' else '— engines ran different populations; only genuinely co-executed tests are compared below.'}</div>
+<div class='basis'>⚖ Comparison basis: <strong>{_basis}</strong></div>
 <div class='cmp-scores'>
   <div class='cmp-cell'>{_prov('chromium', chromium.run_label)}<div class='cmp-mob'>Mobile {c_mob if c_mob is not None else 'n/a'}</div></div>
   <div class='cmp-vs'>vs</div>
@@ -499,14 +521,25 @@ def _render_mobile_compact(ed: EngineData) -> str:
         groups = group_findings([f for f in findings if str(f.get("severity", "")).lower() != "info"])
     except Exception:
         groups = []
-    top = sorted(groups, key=lambda g: g.get("count", 0), reverse=True)[:15] if groups else []
+    # Roll patterns UP to the RULE level (severity + check), so a check that
+    # fires on 40 elements is ONE actionable 'fix once → clear many' row rather
+    # than 40 near-identical tap_target rows.
+    _sev_rank = {"blocker": 0, "major": 1, "minor": 2, "info": 3}
+    rules: dict[tuple, dict] = {}
+    for g in groups:
+        key = (str(g.get("severity", "")).lower(), str(g.get("category", "")))
+        r = rules.setdefault(key, {"occ": 0, "devices": set(), "pages": set(), "variants": 0})
+        r["occ"] += int(g.get("count", 0) or 0)
+        r["devices"].update(g.get("devices") or [])
+        r["pages"].update(g.get("pages") or [])
+        r["variants"] += 1
+    rule_rows = sorted(rules.items(), key=lambda kv: (_sev_rank.get(kv[0][0], 9), -kv[1]["occ"]))
     rows = "".join(
-        f"<tr><td>{esc(str(g.get('severity','')))}</td><td>{esc(str(g.get('category','')))}</td>"
-        f"<td>{esc(str(g.get('pattern', g.get('message',''))))[:90]}</td>"
-        f"<td style='text-align:right'>{g.get('count',0)}</td>"
-        f"<td style='text-align:right'>{len(g.get('devices',[]) or [])}</td></tr>"
-        for g in top
-    ) or "<tr><td colspan='5' class='muted'>no actionable patterns</td></tr>"
+        f"<tr><td>{esc(s)}</td><td class='mono'>{esc(cat)}</td>"
+        f"<td class='num'>{d['occ']}</td><td class='num'>{len(d['devices'])}</td>"
+        f"<td class='num'>{len(d['pages'])}</td><td class='num'>{d['variants']}</td></tr>"
+        for (s, cat), d in rule_rows
+    ) or "<tr><td colspan='6' class='muted'>no actionable rules</td></tr>"
     return (
         f"<div class='mob-strip'>"
         f"<div><span class='scv'>{mob if mob is not None else 'n/a'}</span><div class='sl'>Mobile score</div></div>"
@@ -516,13 +549,18 @@ def _render_mobile_compact(ed: EngineData) -> str:
         f"<div><span class='scv'>{sev['major']}</span><div class='sl'>Major</div></div>"
         f"<div><span class='scv'>{sev['minor']}</span><div class='sl'>Minor</div></div>"
         f"<div><span class='scv'>{sev['info']}</span><div class='sl'>Info</div></div>"
-        f"<div><span class='scv'>{len(groups)}</span><div class='sl'>Unique patterns</div></div>"
+        f"<div><span class='scv'>{len(rules)}</span><div class='sl'>Rules</div></div>"
         f"</div>"
-        f"<table><thead><tr><th>Severity</th><th>Category</th><th>Issue pattern</th>"
-        f"<th style='text-align:right'>Occurrences</th><th style='text-align:right'>Devices</th></tr></thead>"
+        f"<table><thead><tr><th>Severity</th><th>Rule / check</th>"
+        f"<th class='num'>Occurrences</th><th class='num'>Devices</th>"
+        f"<th class='num'>Pages</th><th class='num'>Distinct elements</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
-        f"<p class='note'>Top {len(top)} of {len(groups)} unique patterns · {len(findings)} raw findings. "
-        f"Full raw table lives in the per-engine dashboard.</p>"
+        f"<p class='note'>Grouped by <strong>rule</strong> (fix once → clear many): "
+        f"{len(rules)} rule(s) rolled up from {len(groups)} unique patterns / {len(findings)} raw findings. "
+        f"Per-element detail lives in the per-engine dashboard.</p>"
+        f"<p class='note'>Mobile findings are <strong>engine-specific</strong> — counts differ between "
+        f"engines because of executable checks, structural N/A (engine can't run them), and engine-specific "
+        f"DOM/layout behaviour. Compare mobile across engines only via the Engine Comparison coverage matrix.</p>"
     )
 
 
@@ -675,6 +713,7 @@ td.eng{white-space:nowrap}
 .eng-pop{font-size:11px;color:#64748b;margin-top:6px}
 .prov-row{margin-top:8px}
 .rel-scope{background:#e0e7ff;color:#3730a3}
+.basis{border-radius:10px;padding:8px 12px;font-size:12px;margin:8px 0;background:#eef2ff;border:1px solid #c7d2fe;color:#3730a3}
 .elig{border-radius:10px;padding:10px 12px;font-size:12px;margin:12px 0}
 .elig-partial{background:#fffbeb;border:1px solid #fde68a;color:#92400e}
 .elig-full{background:#dcfce7;border:1px solid #bbf7d0;color:#166534}
@@ -722,8 +761,8 @@ def build(base: str = "reports/trend", out: Path | str = OUT_PATH) -> Path:
     # Chromium → WebKit → Detailed Issues (drill-down).
     sections = "".join([
         _section("sec-exec", "Executive Summary", _render_exec_summary(engines)),
-        _section("sec-systemic", "Cross-Engine · Systemic Concentration", _render_systemic(engines)),
-        _section("sec-recurring", "Cross-Engine · Recurring Failures",
+        _section("sec-systemic", "Cross-Engine · Failure Concentration", _render_systemic(engines)),
+        _section("sec-recurring", "Cross-Engine · Failure History",
                  _render_recurring(base), _prov("chromium", chromium.run_label, "run history")),
         _section("sec-login", "Cross-Engine · 🔐 Login Route Observations",
                  _render_login_routes(engines)),
