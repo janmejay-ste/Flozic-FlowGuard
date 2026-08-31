@@ -919,20 +919,39 @@ def _render_mobile_compact(ed: EngineData) -> str:
     # dashboard. Severity-ordered, capped to keep the export bounded.
     _sev = {"blocker": 0, "major": 1, "minor": 2, "info": 3}
     elem = "".join(
-        f"<tr><td>{_sev_chip(f.get('severity',''))}</td>"
+        f"<tr data-sev='{esc(str(f.get('severity','')).lower())}' "
+        f"data-rank='{_sev.get(str(f.get('severity','')).lower(), 9)}'>"
+        f"<td>{_sev_chip(f.get('severity',''))}</td>"
         f"<td class='mono'>{esc(str(f.get('category','')))}</td>"
         f"<td>{esc(str(f.get('message',''))[:150])}</td>"
         f"<td>{esc(str(f.get('device','')))}</td>"
         f"<td>{esc(str(f.get('page','')))}</td>"
         f"<td class='mono'>{esc(str(f.get('selector') or '—'))}</td>"
         f"<td class='rec'>{esc(_recommendation_for(f.get('category','')))}</td></tr>"
-        for f in sorted(findings, key=lambda x: _sev.get(str(x.get('severity','')).lower(), 9))[:200]
+        # All rows render (no cap): the table lives in a collapsed accordion, and
+        # a cap sliced after the severity sort silently dropped every info row —
+        # making the Info filter show 0 of 233.
+        for f in sorted(findings, key=lambda x: _sev.get(str(x.get('severity','')).lower(), 9))
     ) or "<tr><td colspan='7' class='muted'>none</td></tr>"
-    _more = f"<p class='note'>Showing first 200 of {len(findings)}.</p>" if len(findings) > 200 else ""
+    _more = ""
+    tid = f"elem-{esc(ed.engine)}"
+    sev_btns = "".join(
+        f"<button class='sev-btn{' on' if key == 'all' else ''}' "
+        f"onclick=\"filterElem('{tid}','{key}',this)\">{label}{count}</button>"
+        for key, label, count in [
+            ("all", "All", f" ({len(findings)})"),
+            ("blocker", "Blocker", f" ({sev['blocker']})"),
+            ("major", "Major", f" ({sev['major']})"),
+            ("minor", "Minor", f" ({sev['minor']})"),
+            ("info", "Info", f" ({sev['info']})"),
+        ]
+    )
     elem_drill = (
         f"<details class='drill'><summary>View all {len(findings)} per-element findings "
         "(element · device · page · selector · recommended)</summary>"
-        "<table><thead><tr><th>Severity</th><th>Check</th><th>Element / issue</th>"
+        f"<div class='elem-controls'><span class='sl'>Filter severity:</span> {sev_btns}"
+        f"<button class='sev-btn sort' data-dir='asc' onclick=\"sortElem('{tid}',this)\">Severity ↑</button></div>"
+        f"<table id='{tid}'><thead><tr><th>Severity</th><th>Check</th><th>Element / issue</th>"
         "<th>Device</th><th>Page</th><th>Selector</th><th>Recommended</th></tr></thead>"
         f"<tbody>{elem}</tbody></table>{_more}</details>"
     )
@@ -1122,6 +1141,11 @@ th:last-child{white-space:nowrap}
 .fg-export-btn:hover{background:#eef2f7}
 .prov{display:inline-block;border:1px solid;border-radius:999px;padding:1px 8px;font-size:10px;font-weight:700;vertical-align:middle;background:#fff;white-space:nowrap}
 .sev-chip{display:inline-block;border-radius:999px;padding:1px 8px;font-size:10px;font-weight:800;letter-spacing:.4px;white-space:nowrap}
+.elem-controls{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0}
+.sev-btn{border:1px solid #cbd5e1;background:#fff;color:#334155;font-size:12px;font-weight:600;padding:4px 12px;border-radius:999px;cursor:pointer}
+.sev-btn:hover{background:#f1f5f9}
+.sev-btn.on{background:#3730a3;border-color:#3730a3;color:#fff}
+.sev-btn.sort{margin-left:auto;border-radius:8px}
 table.ovr{margin:12px 0}
 table.ovr th{white-space:nowrap}
 table.ovr td:first-child{font-weight:600;color:#475569}
@@ -1229,6 +1253,25 @@ details.drill[open] summary{margin-bottom:6px}
 """
 
 _JS = """
+function filterElem(id, sev, btn){
+  var t=document.getElementById(id); if(!t) return;
+  t.querySelectorAll('tbody tr').forEach(function(r){
+    r.style.display = (sev==='all' || r.dataset.sev===sev) ? '' : 'none';
+  });
+  btn.parentElement.querySelectorAll('.sev-btn:not(.sort)').forEach(function(b){ b.classList.remove('on'); });
+  btn.classList.add('on');
+}
+function sortElem(id, btn){
+  var t=document.getElementById(id); if(!t) return;
+  var tb=t.querySelector('tbody');
+  var dir = btn.dataset.dir==='asc' ? 'desc' : 'asc';
+  btn.dataset.dir = dir;
+  btn.textContent = dir==='asc' ? 'Severity \\u2191' : 'Severity \\u2193';
+  Array.from(tb.querySelectorAll('tr'))
+    .sort(function(a,b){ var x=+(a.dataset.rank||9), y=+(b.dataset.rank||9);
+                         return dir==='asc' ? x-y : y-x; })
+    .forEach(function(r){ tb.appendChild(r); });
+}
 function exportSection(id){
   var secs=document.querySelectorAll('.fg-section');
   var target=document.getElementById(id);
