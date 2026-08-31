@@ -157,7 +157,10 @@ def test_engine_block_domains_from_sidecar():
                  sidecar={"health": {"product": 100, "infrastructure": 100, "framework": 100},
                           "js_error_clusters": []})
     html = cb._render_engine_block(ed)
-    assert "Product 100 · Infra 100 · Framework 100" in html
+    # Domains render as health cards (old-dashboard style), values from the sidecar.
+    assert "Product Health" in html and "Infra Health" in html and "Framework Health" in html
+    assert html.count(">100<") >= 3   # the three domain values as big numbers
+    assert "hcard" in html            # rich card presentation
     assert "No JS error clusters recorded" in html   # empty list = real result, not pending
 
 

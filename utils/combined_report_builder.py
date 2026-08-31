@@ -741,36 +741,72 @@ def _render_js_clusters(clusters: list[dict]) -> str:
     )
 
 
+def _stat_tiles(records: list) -> str:
+    """The old dashboard's Total/Passed/Failed/Skipped/Pass-rate tiles —
+    computed by COUNTING records (not a score recompute), so always real."""
+    total = len(records)
+    passed = sum(1 for r in records if r.status == "PASS")
+    failed = sum(1 for r in records if r.status == "FAIL")
+    skipped = sum(1 for r in records if r.status == "SKIP")
+    rate = f"{round(passed / total * 100, 1)}%" if total else "—"
+    tiles = [
+        ("Total", total, "#eef2ff", "#4338ca"), ("Passed", passed, "#dcfce7", "#15803d"),
+        ("Failed", failed, "#fee2e2", "#b91c1c"), ("Skipped", skipped, "#f1f5f9", "#64748b"),
+        ("Pass rate", rate, "#dbeafe", "#0369a1"),
+    ]
+    cells = "".join(
+        f"<div class='tile' style='background:{bg}'><div class='tile-v' style='color:{c}'>{v}</div>"
+        f"<div class='tile-l'>{esc(lbl)}</div></div>"
+        for lbl, v, bg, c in tiles
+    )
+    return f"<div class='tiles'>{cells}</div>"
+
+
+def _hcard(label: str, val) -> str:
+    if not isinstance(val, int):
+        return (f"<div class='hcard hcard-pending'><div class='hcard-v'>⏳</div>"
+                f"<div class='hcard-l'>{esc(label)}</div><div class='hcard-b'>pending sidecar</div></div>")
+    bl, txt, bg = score_band(val)
+    return (f"<div class='hcard' style='background:{bg}'><div class='hcard-v' style='color:{txt}'>{val}</div>"
+            f"<div class='hcard-l'>{esc(label)}</div><div class='hcard-b' style='color:{txt}'>{esc(bl)}</div></div>")
+
+
+def _health_cards(ed: EngineData) -> str:
+    """The old dashboard's big Product/Infra/Framework/Mobile health cards.
+    Domains come from the authoritative sidecar (never recomputed); Overall &
+    Mobile from the run's trend row."""
+    auth = ed.auth or {}
+    hs = (ed.sidecar or {}).get("health") or {}
+    overall = auth.get("overall")
+    ov_band = score_band(overall)[0] if isinstance(overall, int) else "—"
+    cards = (_hcard("Product Health", hs.get("product")) + _hcard("Infra Health", hs.get("infrastructure"))
+             + _hcard("Framework Health", hs.get("framework")) + _hcard("Mobile", auth.get("mobile")))
+    sc_pop = (ed.sidecar or {}).get("population") or {}
+    note = ""
+    if sc_pop.get("total") and sc_pop["total"] != len(ed.records):
+        note = (f"<p class='note'>⚠ Product / Infra / Framework are from a "
+                f"<strong>{esc(str(sc_pop.get('suite', '?')))}</strong> run ({sc_pop['total']} tests); the "
+                f"tiles above are the latest {len(ed.records)}-test run. A fresh full run refreshes both together.</p>")
+    return (
+        f"<div class='hoverall'><span class='hoverall-v'>{overall if overall is not None else 'n/a'}</span>"
+        f"<span class='hoverall-l'>Overall · {esc(ov_band)}</span></div>"
+        f"<div class='hcards'>{cards}</div>{note}"
+    )
+
+
 def _render_engine_block(ed: EngineData) -> str:
     if not ed.present:
         return f"<p class='muted'>No persisted run for {esc(ed.engine)}.</p>"
-    auth = ed.auth or {}
-    # Domain scores come ONLY from the sidecar's authoritative `health` block,
-    # NEVER recomputed here. Absent → ⏳ pending.
-    health_sc = (ed.sidecar or {}).get("health") or {}
-    overall = auth.get("overall")
-    band = f" <span class='prov'>{esc(score_band(overall)[0])}</span>" if isinstance(overall, int) else ""
-
-    def _dom(key: str, label: str) -> str:
-        v = health_sc.get(key)
-        return f"{label} {v}" if isinstance(v, int) else f"{label} ⏳"
-
-    if {"product", "infrastructure", "framework"} & health_sc.keys():
-        domains = f"{_dom('product','Product')} · {_dom('infrastructure','Infra')} · {_dom('framework','Framework')}"
-    else:
-        domains = "<span class='muted'>Product / Infra / Framework: ⏳ pending sidecar (run with persistence)</span>"
-    health = (
-        f"<div class='blk-health'><span class='scv'>{overall if overall is not None else 'n/a'}</span>"
-        f"<div class='sl'>Overall{band}</div><div class='note'>{domains}</div></div>"
-    )
-
-    # JS errors: from the sidecar when present (empty list = a real 'no errors'
-    # result); pending only when the sidecar itself is absent.
     if ed.sidecar is not None and "js_error_clusters" in ed.sidecar:
         js = _render_js_clusters(ed.sidecar.get("js_error_clusters") or [])
     else:
         js = _pending("JS Error Clusters", "utils/health_tracker.get_clusters()")
-    return f"{health}<h3 class='blk'>Mobile</h3>{_render_mobile_compact(ed)}<h3 class='blk'>JS Errors</h3>{js}"
+    return (
+        f"{_stat_tiles(ed.records)}"
+        f"<h3 class='blk'>Health Score</h3>{_health_cards(ed)}"
+        f"<h3 class='blk'>Mobile</h3>{_render_mobile_compact(ed)}"
+        f"<h3 class='blk'>JS Errors</h3>{js}"
+    )
 
 
 def _render_login_routes(engines: list[EngineData]) -> str:
@@ -864,6 +900,20 @@ td.eng{white-space:nowrap}
 .mob-strip{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px}
 .mob-strip>div{text-align:center;min-width:66px}
 .blk-health{background:#f8fafc;border-radius:10px;padding:12px 16px;display:inline-block;margin-bottom:8px}
+.tiles{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:8px}
+.tile{border-radius:12px;padding:16px;text-align:center}
+.tile-v{font-size:30px;font-weight:800;line-height:1}
+.tile-l{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:#64748b;margin-top:4px}
+.hoverall{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}
+.hoverall-v{font-size:34px;font-weight:800;color:#0f172a}
+.hoverall-l{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:#64748b}
+.hcards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.hcard{border:1px solid #e2e8f0;border-radius:12px;padding:16px;text-align:center}
+.hcard-pending{background:#fffbeb;border-color:#fde68a}
+.hcard-v{font-size:34px;font-weight:800;line-height:1}
+.hcard-l{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#475569;margin-top:4px}
+.hcard-b{font-size:10px;font-weight:700;margin-top:2px}
+@media(max-width:720px){.tiles{grid-template-columns:repeat(2,1fr)}.hcards{grid-template-columns:repeat(2,1fr)}}
 .rel-banner{border-radius:12px;padding:14px 18px;font-size:20px;font-weight:800;margin-bottom:16px;display:flex;flex-direction:column;gap:2px}
 .rel-banner .rel-why{font-size:11px;font-weight:600;opacity:.85;text-transform:none;letter-spacing:0}
 .rel-banner.rel-blocked{background:#fee2e2;color:#991b1b;border:1px solid #fecaca}
