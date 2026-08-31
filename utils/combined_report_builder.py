@@ -285,32 +285,105 @@ def _release_reason(engines: list[EngineData], overall: str) -> str:
     return "no completed run to decide from"
 
 
-def _render_exec_summary(engines: list[EngineData]) -> str:
-    overall = _overall_release(engines)
-    cards = []
+_SEV_CHIP = {
+    "blocker": ("#b91c1c", "#fee2e2"), "major": ("#c2410c", "#ffedd5"),
+    "minor": ("#92400e", "#fef3c7"), "info": ("#475569", "#f1f5f9"),
+}
+
+
+def _sev_chip(sev: str) -> str:
+    c, bg = _SEV_CHIP.get(str(sev).lower(), ("#475569", "#f1f5f9"))
+    return (f"<span class='sev-chip' style='color:{c};background:{bg}'>"
+            f"{esc(str(sev).upper())}</span>")
+
+
+def _mobile_stats(ed: EngineData) -> dict:
+    """Per-engine mobile numbers for the overview table (same sources as the
+    mobile strip: authoritative score, deterministic quality/coverage, counts)."""
+    out = {"score": None, "quality": None, "coverage": None,
+           "blocker": 0, "major": 0, "minor": 0, "info": 0, "rules": None}
+    out["score"] = (ed.auth or {}).get("mobile")
+    if ed.layered is not None:
+        out["quality"] = getattr(ed.layered, "mobile_quality", None)
+        cov = getattr(ed.layered, "mobile_coverage", None)
+        out["coverage"] = f"{round(cov * 100)}%" if isinstance(cov, (int, float)) else None
+    findings = (ed.mobile or {}).get("findings") or []
+    for f in findings:
+        s = str(f.get("severity", "")).lower()
+        if s in out:
+            out[s] += 1
+    try:
+        from utils.ai_mobile_triage import group_findings
+        groups = group_findings([f for f in findings if str(f.get("severity", "")).lower() != "info"])
+        out["rules"] = len({(str(g.get("severity", "")).lower(), str(g.get("category", ""))) for g in groups})
+    except Exception:
+        pass
+    return out
+
+
+def _render_engine_overview(engines: list[EngineData]) -> str:
+    """Side-by-side Chromium | WebKit metric table at the top of the report:
+    Health Score / Test Results / Mobile rows, one column per engine."""
+    def cell_score(v):
+        if not isinstance(v, int):
+            return "<td class='num muted'>n/a</td>"
+        bl, txt, bg = score_band(v)
+        return (f"<td class='num' style='background:{bg}'><strong style='color:{txt}'>{v}</strong>"
+                f" <span style='color:{txt};font-size:10px;font-weight:700'>{esc(bl)}</span></td>")
+
+    def cell(v):
+        return f"<td class='num'>{esc(str(v)) if v is not None else '<span class=muted>n/a</span>'}</td>"
+
+    cols, status_cells, rowsets = [], [], []
     for ed in engines:
-        auth = ed.auth
-        if not auth:
-            cards.append(
-                f"<div class='eng-card'><div class='eng-name'>{esc(ed.engine)}</div>"
-                f"<div class='muted'>no completed run in trend history</div></div>"
-            )
-            continue
-        total = auth.get("total") or 0
-        suite = "Full suite" if _is_full(auth) else "Mobile-only (partial scope)"
-        ov = auth.get("overall")
-        band = score_band(ov)[0] if isinstance(ov, int) else "—"
-        label, cls = _engine_status_label(auth)
-        cards.append(
-            "<div class='eng-card'>"
-            f"<div class='eng-name'>{esc(ed.engine)}</div>"
-            f"<div class='eng-score'>{ov if ov is not None else 'n/a'}</div>"
-            f"<div class='eng-band'>{esc(band)}</div>"
-            f"<div class='rel rel-{cls}'>{esc(label)}</div>"
-            f"<div class='eng-pop'>{esc(suite)} · {total} tests · {auth.get('failed', 0)} failed · Mobile {auth.get('mobile', 'n/a')}</div>"
-            f"<div class='prov-row'>{_prov(ed.engine, ed.run_label)}</div>"
-            "</div>"
-        )
+        auth = ed.auth or {}
+        hs = (ed.sidecar or {}).get("health") or {}
+        recs = ed.records
+        total = len(recs); passed = sum(1 for r in recs if r.status == "PASS")
+        failed = sum(1 for r in recs if r.status == "FAIL"); skipped = sum(1 for r in recs if r.status == "SKIP")
+        rate = f"{round(passed / total * 100, 1)}%" if total else None
+        label, cls = _engine_status_label(auth) if auth else ("—", "scope")
+        status_cells.append(f"<td class='num'><span class='rel rel-{cls}'>{esc(label)}</span></td>")
+        cols.append(f"<th class='num'>{_prov(ed.engine, ed.run_label)}</th>")
+        m = _mobile_stats(ed)
+        rowsets.append({
+            "Overall": cell_score(auth.get("overall")),
+            "Product Health": cell_score(hs.get("product")),
+            "Infra Health": cell_score(hs.get("infrastructure")),
+            "Framework Health": cell_score(hs.get("framework")),
+            "Mobile": cell_score(auth.get("mobile")),
+            "Total": cell(total or auth.get("total")),
+            "Passed": cell(passed), "Failed": cell(failed), "Skipped": cell(skipped),
+            "Pass rate": cell(rate),
+            "Mobile score": cell(m["score"]), "Quality": cell(m["quality"]),
+            "Coverage": cell(m["coverage"]), "Blocker": cell(m["blocker"]),
+            "Major": cell(m["major"]), "Minor": cell(m["minor"]),
+            "Info": cell(m["info"]), "Rules": cell(m["rules"]),
+        })
+
+    def group(title: str, keys: list[str]) -> str:
+        n = len(engines) + 1
+        rows = f"<tr class='ovr-grp'><td colspan='{n}'>{esc(title)}</td></tr>"
+        for k in keys:
+            rows += f"<tr><td>{esc(k)}</td>" + "".join(rs[k] for rs in rowsets) + "</tr>"
+        return rows
+
+    body = (
+        f"<tr><td>Status</td>{''.join(status_cells)}</tr>"
+        + group("Health Score", ["Overall", "Product Health", "Infra Health", "Framework Health", "Mobile"])
+        + group("Test Results", ["Total", "Passed", "Failed", "Skipped", "Pass rate"])
+        + group("Mobile", ["Mobile score", "Quality", "Coverage", "Blocker", "Major", "Minor", "Info", "Rules"])
+    )
+    return (
+        "<table class='ovr'><thead><tr><th>Metric</th>" + "".join(cols)
+        + f"</tr></thead><tbody>{body}</tbody></table>"
+    )
+
+
+def _render_exec_summary(engines: list[EngineData]) -> str:
+    """Release banner + the side-by-side Chromium | WebKit metric table
+    (Health Score / Test Results / Mobile rows, one column per engine)."""
+    overall = _overall_release(engines)
     elig = _eligibility(engines)
     warn = (
         "" if elig == "Full" else
@@ -323,7 +396,7 @@ def _render_exec_summary(engines: list[EngineData]) -> str:
         f"<div class='rel-banner rel-{overall.lower()}'>RELEASE: {esc(overall)}"
         f"<span class='rel-why'>Release decision = {esc(overall)} because "
         f"{esc(_release_reason(engines, overall))}.</span></div>"
-        f"<div class='eng-cards'>{''.join(cards)}</div>"
+        f"{_render_engine_overview(engines)}"
         f"{warn}"
         "<p class='note'>Product / Infra / Framework per engine are shown in the per-engine sections below, "
         "and read ⏳ until the <code>report-data.json</code> sidecar persists them "
@@ -721,7 +794,7 @@ def _render_mobile_compact(ed: EngineData) -> str:
         r["variants"] += 1
     rule_rows = sorted(rules.items(), key=lambda kv: (_sev_rank.get(kv[0][0], 9), -kv[1]["occ"]))
     rows = "".join(
-        f"<tr><td>{esc(s)}</td><td class='mono'>{esc(cat)}</td>"
+        f"<tr><td>{_sev_chip(s)}</td><td class='mono'>{esc(cat)}</td>"
         f"<td class='num'>{d['occ']}</td><td class='num'>{len(d['devices'])}</td>"
         f"<td class='num'>{len(d['pages'])}</td><td class='num'>{d['variants']}</td>"
         f"<td class='rec'>{esc(_recommendation_for(cat))}</td></tr>"
@@ -732,7 +805,7 @@ def _render_mobile_compact(ed: EngineData) -> str:
     # dashboard. Severity-ordered, capped to keep the export bounded.
     _sev = {"blocker": 0, "major": 1, "minor": 2, "info": 3}
     elem = "".join(
-        f"<tr><td>{esc(str(f.get('severity','')))}</td>"
+        f"<tr><td>{_sev_chip(f.get('severity',''))}</td>"
         f"<td class='mono'>{esc(str(f.get('category','')))}</td>"
         f"<td>{esc(str(f.get('message',''))[:150])}</td>"
         f"<td>{esc(str(f.get('device','')))}</td>"
@@ -768,7 +841,9 @@ def _render_mobile_compact(ed: EngineData) -> str:
         f"{len(rules)} rule(s) rolled up from {len(groups)} unique patterns / {len(findings)} raw findings. "
         "The <strong>Recommended</strong> column is the fix for each check.</p>"
         f"{elem_drill}"
-        f"<h4 class='blk'>AI Triage</h4>{_render_mobile_ai_triage(ed.mobile)}"
+        f"<details class='drill'><summary>🤖 AI Triage — "
+        f"{len(((ed.mobile or {}).get('ai_triage') or {}).get('groups') or [])} group(s), "
+        f"click to expand</summary>{_render_mobile_ai_triage(ed.mobile)}</details>"
         f"<p class='note'>Mobile findings are <strong>engine-specific</strong> — counts differ between "
         f"engines because of executable checks, structural N/A (engine can't run them), and engine-specific "
         f"DOM/layout behaviour. Compare mobile across engines only via the Engine Comparison coverage matrix.</p>"
@@ -920,7 +995,12 @@ td.rec{color:#166534;background:#f0fdf4;font-size:12px;font-weight:600}
 th:last-child{white-space:nowrap}
 .fg-export-btn{border:1px solid #cbd5e1;background:#f8fafc;color:#334155;font-size:12px;font-weight:600;padding:6px 12px;border-radius:8px;cursor:pointer;white-space:nowrap}
 .fg-export-btn:hover{background:#eef2f7}
-.prov{display:inline-block;border:1px solid;border-radius:999px;padding:1px 8px;font-size:10px;font-weight:700;vertical-align:middle;background:#fff}
+.prov{display:inline-block;border:1px solid;border-radius:999px;padding:1px 8px;font-size:10px;font-weight:700;vertical-align:middle;background:#fff;white-space:nowrap}
+.sev-chip{display:inline-block;border-radius:999px;padding:1px 8px;font-size:10px;font-weight:800;letter-spacing:.4px;white-space:nowrap}
+table.ovr{margin:12px 0}
+table.ovr th{white-space:nowrap}
+table.ovr td:first-child{font-weight:600;color:#475569}
+tr.ovr-grp td{background:#f1f5f9;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.8px;color:#334155;padding:5px 10px}
 .note{color:#64748b;font-size:12px;margin-bottom:10px}
 .muted{color:#94a3b8;font-style:italic}
 .mono,.feat{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
