@@ -283,12 +283,17 @@ def _release_reason(engines: list[EngineData], overall: str) -> str:
     drivers = [ed for ed in engines
                if str((ed.auth or {}).get("status", "")).upper() == overall]
     full_driver = next((ed for ed in drivers if _is_full(ed.auth)), None)
+
+    def _counts(ed: EngineData) -> str:
+        a = ed.auth or {}
+        return f"{a.get('failed', 0)} of {a.get('total', 0)} tests failed"
+
     if full_driver:
-        return (f"the full-suite {full_driver.engine} run is {overall}; "
+        return (f"the full-suite {full_driver.engine} run is {overall} ({_counts(full_driver)}); "
                 "partial-scope coverage on other engines cannot override a full-suite decision")
     if drivers:
-        return (f"{drivers[0].engine} is {overall} (no full-suite run to override it — "
-                "treat this as provisional until a full suite runs)")
+        return (f"{drivers[0].engine} is {overall} ({_counts(drivers[0])}; no full-suite run to "
+                "override it — treat this as provisional until a full suite runs)")
     return "no completed run to decide from"
 
 
@@ -403,6 +408,7 @@ def _render_exec_summary(engines: list[EngineData]) -> str:
         f"<div class='rel-banner rel-{overall.lower()}'>RELEASE: {esc(overall)}"
         f"<span class='rel-why'>Release decision = {esc(overall)} because "
         f"{esc(_release_reason(engines, overall))}.</span></div>"
+        f"{_render_primary_issue(engines)}"
         f"{_render_engine_overview(engines)}"
         f"{warn}"
         "<p class='note'>Product / Infra / Framework per engine are shown in the per-engine sections below, "
@@ -611,43 +617,34 @@ def _render_combined_issues(engines: list[EngineData]) -> str:
     return intro + "".join(cards)
 
 
-def _render_systemic(engines: list[EngineData]) -> str:
-    """FAILURE CONCENTRATION — many failures in the same FEATURE. This is the
-    WEAKEST of the three signals and does NOT claim a common cause: 27 failures
-    in one feature could be 10 backend + 8 selector + 5 data + 4 product. For a
-    proven common cause see the Systemic Failures section (signature-matched)."""
-    blocks = []
-    for ed in engines:
-        by_feat: dict[str, int] = {}
-        for r in ed.records:
-            if r.status == "FAIL":
-                by_feat[r.feature] = by_feat.get(r.feature, 0) + 1
-        hot = sorted(((n, f) for f, n in by_feat.items() if n >= 3), reverse=True)
-        if not hot:
-            continue
-        items = "".join(
-            f"<li><strong>{n}</strong> failures — <span class='feat'>{esc(f)}</span></li>"
-            for n, f in hot
-        )
-        blocks.append(f"<div class='sysblk'>{_prov(ed.engine, ed.run_label)}<ul>{items}</ul></div>")
-    if not blocks:
-        return "<p class='muted'>No feature has ≥3 failures this run.</p>"
-    return (
-        "<p class='note'><strong>Concentration ≠ common cause.</strong> This groups failures by "
-        "FEATURE only — it does not prove they share a root cause. Signature-matched grouping is in "
-        "the Systemic Failures section below.</p>" + "".join(blocks)
-    )
+def _failure_type(signature: str) -> str:
+    """Plain-English failure type from a raw signature — deterministic, so the
+    interpretation can never misread the error the way a human summary might."""
+    s = signature or ""
+    if "TimeoutError" in s or "Timeout" in s:
+        return "Timeout — an expected UI state never appeared"
+    if "net::" in s or "NameResolution" in s or "ERR_" in s:
+        return "Network / connectivity"
+    if "AssertionError" in s:
+        return "Assertion — the page state did not match the expectation"
+    if "strict mode violation" in s:
+        return "Locator ambiguity"
+    return "Unclassified error"
 
 
-def _render_systemic_failures(engines: list[EngineData]) -> str:
-    """SYSTEMIC FAILURES — independent tests whose NORMALIZED failure signatures
-    MATCH (a proven common cause), computed by failure_clustering.detect_systemic.
-    Distinct from Failure Concentration: membership requires a matching real
-    signature, never mere feature co-location."""
-    from utils.failure_clustering import detect_systemic
+def _action_for_type(ftype: str) -> str:
+    if ftype.startswith("Timeout"):
+        return ("Investigate why the awaited element never appears — backend workflow "
+                "stall or selector drift — starting from the evidence cards below.")
+    if ftype.startswith("Network"):
+        return "Treat as infrastructure: verify connectivity, then re-run before triaging as product."
+    if ftype.startswith("Assertion"):
+        return "Compare the asserted expectation against the screenshot/DOM evidence."
+    return "Open the failure evidence cards in Detailed Issues."
 
-    fail_records: list[dict] = []
-    signed = 0
+
+def _collect_fail_records(engines: list[EngineData]) -> tuple[list[dict], int]:
+    fail_records, signed = [], 0
     for ed in engines:
         for r in ed.records:
             if r.status != "FAIL":
@@ -659,6 +656,89 @@ def _render_systemic_failures(engines: list[EngineData]) -> str:
                 "method": f"{r.clazz}::{r.method}", "feature": r.feature,
                 "errorSignature": sig, "engine": ed.engine, "status": "FAIL",
             })
+    return fail_records, signed
+
+
+def _render_primary_issue(engines: list[EngineData]) -> str:
+    """The 5-second answer: the single biggest problem this run, derived
+    deterministically from the systemic detector (largest signature cluster),
+    falling back to the largest feature concentration. Empty when nothing failed."""
+    fail_records, signed = _collect_fail_records(engines)
+    if not fail_records:
+        return ""
+    top = None
+    if signed:
+        try:
+            from utils.failure_clustering import detect_systemic
+            clusters = detect_systemic(fail_records, min_tests=2)
+            top = clusters[0] if clusters else None
+        except Exception:
+            top = None
+    if top is not None:
+        ftype = _failure_type(top.sample_message)
+        return (
+            "<div class='primary'><div class='primary-t'>⚠ PRIMARY ISSUE</div>"
+            f"<div class='primary-h'>{esc(ftype)} in {esc(', '.join(top.sample_features[:3]) or 'multiple areas')}</div>"
+            f"<div class='primary-m'><span><strong>{top.affected_tests}</strong> affected test(s)</span>"
+            f"<span>engine: {esc(', '.join(top.engines) or '—')}</span>"
+            f"<span>confidence: {esc(top.confidence)}</span></div>"
+            f"<div class='primary-a'><strong>Recommended action:</strong> {esc(_action_for_type(ftype))}</div></div>"
+        )
+    # No signature cluster — fall back to the biggest feature concentration.
+    by_feat: dict[tuple, int] = {}
+    for r in fail_records:
+        by_feat[(r["engine"], r["feature"])] = by_feat.get((r["engine"], r["feature"]), 0) + 1
+    (eng, feat), n = max(by_feat.items(), key=lambda kv: kv[1])
+    return (
+        "<div class='primary'><div class='primary-t'>⚠ PRIMARY ISSUE</div>"
+        f"<div class='primary-h'>{n} failure(s) concentrated in {esc(feat)}</div>"
+        f"<div class='primary-m'><span>engine: {esc(eng)}</span>"
+        "<span>no shared signature — causes may differ</span></div>"
+        "<div class='primary-a'><strong>Recommended action:</strong> review the failure "
+        "evidence cards in Detailed Issues.</div></div>"
+    )
+
+
+def _render_systemic(engines: list[EngineData]) -> str:
+    """FAILURE CONCENTRATION — many failures in the same FEATURE. This is the
+    WEAKEST of the three signals and does NOT claim a common cause: 27 failures
+    in one feature could be 10 backend + 8 selector + 5 data + 4 product. For a
+    proven common cause see the Systemic Failures section (signature-matched)."""
+    blocks = []
+    for ed in engines:
+        by_feat: dict[str, int] = {}
+        total_fails = 0
+        for r in ed.records:
+            if r.status == "FAIL":
+                by_feat[r.feature] = by_feat.get(r.feature, 0) + 1
+                total_fails += 1
+        hot = sorted(((n, f) for f, n in by_feat.items() if n >= 3), reverse=True)
+        if not hot:
+            continue
+        items = "".join(
+            f"<li><div class='conc-row'><span class='feat'>{esc(f)}</span>"
+            f"<span class='conc-n'><strong>{n}</strong> / {total_fails} failures</span></div>"
+            f"<div class='conc-bar'><div class='conc-fill' style='width:{round(n / total_fails * 100)}%'></div></div></li>"
+            for n, f in hot
+        )
+        blocks.append(f"<div class='sysblk'>{_prov(ed.engine, ed.run_label)}<ul>{items}</ul></div>")
+    if not blocks:
+        return "<p class='muted'>No feature has ≥3 failures this run.</p>"
+    return (
+        "<p class='note'><strong>Concentration ≠ common cause.</strong> This groups failures by "
+        "FEATURE only — it does not prove they share a root cause. Signature-matched grouping is in "
+        "the Systemic Failures section above.</p>" + "".join(blocks)
+    )
+
+
+def _render_systemic_failures(engines: list[EngineData]) -> str:
+    """SYSTEMIC FAILURES — independent tests whose NORMALIZED failure signatures
+    MATCH (a proven common cause), computed by failure_clustering.detect_systemic.
+    Distinct from Failure Concentration: membership requires a matching real
+    signature, never mere feature co-location."""
+    from utils.failure_clustering import detect_systemic
+
+    fail_records, signed = _collect_fail_records(engines)
 
     if signed == 0:
         return (
@@ -684,8 +764,12 @@ def _render_systemic_failures(engines: list[EngineData]) -> str:
         methods = "".join(f"<li><code>{esc(m)}</code></li>" for m in s.test_methods[:30])
         if len(s.test_methods) > 30:
             methods += f"<li class='muted'>+{len(s.test_methods) - 30} more</li>"
+        ftype = _failure_type(s.sample_message)
         cards.append(
             "<div class='sysfail'>"
+            f"<div class='sysfail-interp'><strong>{esc(ftype)}</strong> — affects "
+            f"<strong>{s.affected_tests}</strong> test(s) in {esc(', '.join(s.sample_features[:3]) or '—')}. "
+            f"{esc(_action_for_type(ftype))}</div>"
             f"<div class='sysfail-head'><span class='sysfail-sig'>“{esc(s.sample_message[:120])}”</span>"
             f"<span class='sysfail-conf' style='color:{col};border-color:{col}'>{esc(s.confidence)} confidence</span></div>"
             f"<div class='sysfail-stats'>"
@@ -1034,6 +1118,16 @@ td.eng{white-space:nowrap}
 .cmp-box h3{font-size:12px;margin-bottom:6px}.cmp-box small{color:#94a3b8;font-weight:600}
 .cmp-box ul{list-style:none;max-height:220px;overflow:auto}.cmp-box li{padding:2px 0;font-size:12px;border-bottom:1px solid #f1f5f9}
 .sysblk{margin-bottom:10px}.sysblk ul{list-style:none;margin-top:6px}.sysblk li{padding:2px 0}
+.primary{border:2px solid #f59e0b;background:#fffbeb;border-radius:12px;padding:14px 18px;margin:14px 0}
+.primary-t{font-size:10px;font-weight:800;letter-spacing:1px;color:#b45309}
+.primary-h{font-size:17px;font-weight:800;color:#78350f;margin:4px 0}
+.primary-m{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:#92400e;margin-bottom:6px}
+.primary-a{font-size:13px;color:#1e293b}
+.conc-row{display:flex;justify-content:space-between;font-size:12px;margin-top:8px}
+.conc-n{color:#64748b}
+.conc-bar{height:8px;border-radius:4px;background:#f1f5f9;margin-top:3px}
+.conc-fill{height:8px;border-radius:4px;background:#f87171}
+.sysfail-interp{font-size:13px;color:#1e293b;background:#fff;border:1px solid #fecaca;border-radius:8px;padding:8px 10px;margin-bottom:8px}
 .sysfail{border:1px solid #fecaca;background:#fef2f2;border-radius:10px;padding:12px;margin-bottom:10px}
 .sysfail-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
 .sysfail-sig{font-family:ui-monospace,Menlo,monospace;font-size:13px;font-weight:700;color:#7f1d1d}
@@ -1131,13 +1225,13 @@ def build(base: str = "reports/trend", out: Path | str = OUT_PATH) -> Path:
     # Chromium → WebKit → Detailed Issues (drill-down).
     sections = "".join([
         _section("sec-exec", "Executive Summary", _render_exec_summary(engines)),
-        _section("sec-systemic", "Cross-Engine · Failure Concentration", _render_systemic(engines)),
+        _section("sec-compare", "Engine Comparison", _render_engine_comparison(chromium, webkit)),
         _section("sec-systemic-failures", "Cross-Engine · Systemic Failures", _render_systemic_failures(engines)),
+        _section("sec-systemic", "Cross-Engine · Failure Concentration", _render_systemic(engines)),
         _section("sec-recurring", "Cross-Engine · Failure History",
                  _render_recurring(base), _prov("chromium", chromium.run_label, "run history")),
         _section("sec-login", "Cross-Engine · 🔐 Login Route Observations",
                  _render_login_routes(engines)),
-        _section("sec-compare", "Engine Comparison", _render_engine_comparison(chromium, webkit)),
         _section("sec-chromium", "Chromium", _render_engine_block(chromium),
                  _prov("chromium", chromium.run_label)),
         _section("sec-webkit", "WebKit", _render_engine_block(webkit),
