@@ -29,6 +29,35 @@ logger = logging.getLogger(__name__)
 DASHBOARD_PATH = Path("reports/trend/dashboard.html")
 TREND_JSON     = Path("reports/trend/trend-history.json")
 
+# The per-engine dashboards are consolidated into the Combined Cross-Engine
+# Report. build() emits a redirect stub instead of the full dashboard; set this
+# True to restore the legacy per-engine page.
+EMIT_FULL_DASHBOARD = False
+
+
+def _redirect_stub_html() -> str:
+    """A tiny page that forwards the (now-retired) per-engine dashboard to the
+    combined report. Computes a relative href from THIS engine's location
+    (chromium: sibling; webkit: ../)."""
+    import os as _os
+    try:
+        href = _os.path.relpath(Path("reports/trend/combined-report.html"), DASHBOARD_PATH.parent)
+    except Exception:
+        href = "combined-report.html"
+    return (
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+        f"<meta http-equiv=\"refresh\" content=\"0; url={href}\">"
+        "<title>Flozic FlowGuard — Combined Report</title>"
+        "<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+        "background:#f1f5f9;color:#1e293b;padding:56px 24px;text-align:center}"
+        "a{color:#3730a3;font-weight:700;font-size:18px;text-decoration:none}"
+        ".sub{color:#64748b;font-size:13px;margin-top:10px}</style></head><body>"
+        "<h2>The per-engine dashboards have been consolidated.</h2>"
+        f"<p>Everything now lives in one place — the <a href=\"{href}\">Combined Cross-Engine Report &rarr;</a></p>"
+        f"<p class=\"sub\">Redirecting… if nothing happens, click the link above.</p>"
+        "</body></html>"
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public entry point
@@ -67,12 +96,20 @@ def build(records: list[TestRecord], started_at_ms: int) -> Path:
                                     check_stats=_engine_cs)
 
     _append_trend(stats, decision, started_at_ms, layered)
-    trend = _load_trend()
 
-    html = _render(records, stats, decision, trend, started_at_ms,
-                   health_score=health_score, layered=layered, clusters=clusters,
-                   mobile_findings=_mobile_findings())
+    # Consolidated reporting: the per-engine dashboards are RETIRED in favour of
+    # the single Combined Cross-Engine Report, which now carries the per-engine
+    # detail + dev-actionable evidence. We still run the full pipeline above so
+    # trend-history and the persisted data the combined report reads stay
+    # correct — we just emit a redirect STUB here instead of a duplicate
+    # dashboard. Flip EMIT_FULL_DASHBOARD to restore the legacy per-engine page.
     DASHBOARD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if EMIT_FULL_DASHBOARD:
+        html = _render(records, stats, decision, _load_trend(), started_at_ms,
+                       health_score=health_score, layered=layered, clusters=clusters,
+                       mobile_findings=_mobile_findings())
+    else:
+        html = _redirect_stub_html()
     DASHBOARD_PATH.write_text(html, encoding="utf-8")
     logger.info("[DashboardBuilder] Written → %s", DASHBOARD_PATH)
     return DASHBOARD_PATH
