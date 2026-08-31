@@ -126,6 +126,7 @@ def _records_from_snapshot(path: str) -> tuple[list[TestRecord], int | None]:
             video_path=t.get("videoPath"),
             harness_fault=bool(t.get("harnessFault", False)),
             error_signature=t.get("errorSignature", ""),
+            artifact_folder=t.get("artifacts"),
         ))
     return recs, d.get("timestamp")
 
@@ -432,31 +433,102 @@ def _render_comparison_coverage(chromium: EngineData, webkit: EngineData) -> str
     )
 
 
+# Cap embedded screenshots so a shared export stays bounded (no Pillow to
+# thumbnail, so we embed raw PNGs). Beyond the cap, cards stay text-only.
+_MAX_EMBEDDED_SHOTS = 12
+
+
+def _load_failure_evidence(folder_name: str | None, embed_shot: bool) -> dict:
+    """Read the on-disk evidence for one failure so it can be INLINED into the
+    report (self-contained for sharing): AI triage.json (diagnosis / fix /
+    category / confidence), the page url.txt, and — up to the cap — screenshot.png
+    embedded as a data-URI so it travels inside the exported file."""
+    ev: dict = {}
+    if not folder_name:
+        return ev
+    base = Path("reports/failures") / folder_name
+    if not base.is_dir():
+        return ev
+    tj = base / "triage.json"
+    if tj.is_file():
+        try:
+            t = json.loads(tj.read_text(encoding="utf-8"))
+            ev.update(diagnosis=t.get("diagnosis"), suggested_fix=t.get("suggested_fix"),
+                      triage_category=t.get("category"), confidence=t.get("confidence"))
+        except (OSError, ValueError):
+            pass
+    u = base / "url.txt"
+    if u.is_file():
+        try:
+            ev["url"] = u.read_text(encoding="utf-8").strip()[:400]
+        except OSError:
+            pass
+    if embed_shot:
+        sc = base / "screenshot.png"
+        if sc.is_file():
+            try:
+                b = sc.read_bytes()
+                if len(b) <= 400_000:
+                    import base64
+                    ev["screenshot"] = "data:image/png;base64," + base64.b64encode(b).decode()
+            except OSError:
+                pass
+    return ev
+
+
 def _render_combined_issues(engines: list[EngineData]) -> str:
-    rows = []
-    for ed in engines:
-        for r in ed.records:
-            if r.status != "FAIL":
-                continue
-            rows.append(
-                "<tr>"
-                f"<td>{_prov(ed.engine, ed.run_label)}</td>"
-                f"<td class='mono'>{esc(r.clazz)}::{esc(r.method)}</td>"
-                f"<td>{esc(r.feature)}</td>"
-                f"<td>{esc(r.category)}</td>"
-                f"<td>{'⚠ harness' if r.harness_fault else 'product/test'}</td>"
-                "</tr>"
-            )
-    if not rows:
+    fails = [(ed, r) for ed in engines for r in ed.records if r.status == "FAIL"]
+    if not fails:
         return "<p class='muted'>No failures across either engine 🎉</p>"
-    return (
-        f"<p class='note'>{len(rows)} failing test(s), each tagged with the engine that observed it. "
-        "The answer to <em>what is wrong</em> is in the sections above; expand for the row-level detail.</p>"
-        f"<details class='drill'><summary>View all {len(rows)} failing tests</summary>"
-        "<table><thead><tr><th>Engine</th><th>Test</th><th>Feature</th><th>Category</th>"
-        "<th>Fault layer</th></tr></thead>"
-        f"<tbody>{''.join(rows)}</tbody></table></details>"
+    # Most-actionable first: failures WITH a captured signature (real, triage-able)
+    # ahead of unsigned ones, so a dev hits the useful cards immediately.
+    fails.sort(key=lambda er: (0 if (er[1].error_signature or "").strip() else 1,
+                               0 if er[1].artifact_folder else 1))
+    cards, embedded = [], 0
+    for ed, r in fails:
+        commit = ((ed.sidecar or {}).get("git", {}) or {}).get("commit") or ""
+        ev = _load_failure_evidence(r.artifact_folder, embed_shot=embedded < _MAX_EMBEDDED_SHOTS)
+        if ev.get("screenshot"):
+            embedded += 1
+        cat = ev.get("triage_category") or ("⚠ harness" if r.harness_fault else "unclassified")
+        sig = (r.error_signature or "").strip()
+        summary = (
+            f"{_prov(ed.engine, ed.run_label)} "
+            f"<code class='mono'>{esc(r.clazz)}::{esc(r.method)}</code> "
+            f"<span class='di-cat'>{esc(cat)}</span>"
+        )
+        body = []
+        if sig:
+            body.append(f"<div class='di-sig'><strong>Error:</strong> <code>{esc(sig[:280])}</code></div>")
+        else:
+            body.append("<div class='muted'>No error signature captured for this failure.</div>")
+        if ev.get("diagnosis"):
+            body.append(f"<div><strong>Diagnosis:</strong> {esc(str(ev['diagnosis']))}</div>")
+        if ev.get("suggested_fix"):
+            body.append(f"<div><strong>Suggested fix:</strong> {esc(str(ev['suggested_fix']))}</div>")
+        meta = [f"feature: {esc(r.feature)}", f"engine: {esc(ed.engine)}"]
+        if ev.get("url"):
+            meta.append(f"page: <a href='{esc(ev['url'])}' target='_blank' rel='noopener'>{esc(ev['url'])}</a>")
+        if commit:
+            meta.append(f"commit: <code>{esc(commit[:10])}</code>")
+        if ev.get("confidence") is not None:
+            meta.append(f"triage confidence: {esc(str(ev['confidence']))}")
+        body.append(f"<div class='di-meta'>{' · '.join(meta)}</div>")
+        if ev.get("screenshot"):
+            # Single embed (not duplicated in an <a href>) to keep the export small.
+            body.append(f"<img class='di-shot' src='{ev['screenshot']}' alt='failure screenshot'>")
+        elif r.artifact_folder:
+            body.append("<div class='muted'>Screenshot available in the evidence folder "
+                        f"(not embedded — over the {_MAX_EMBEDDED_SHOTS}-image cap for this export).</div>")
+        cards.append(f"<details class='di-card'><summary>{summary}</summary>"
+                     f"<div class='di-body'>{''.join(body)}</div></details>")
+    intro = (
+        f"<p class='note'>{len(fails)} failing test(s) — each expands to the <strong>error, AI diagnosis, "
+        "suggested fix, page URL, git commit and an embedded screenshot</strong>, so a developer can act on it "
+        f"straight from this report. {embedded} screenshot(s) embedded (cap {_MAX_EMBEDDED_SHOTS}) to keep the "
+        "export self-contained yet bounded.</p>"
     )
+    return intro + "".join(cards)
 
 
 def _render_systemic(engines: list[EngineData]) -> str:
@@ -605,6 +677,27 @@ def _render_mobile_compact(ed: EngineData) -> str:
         f"<td class='num'>{len(d['pages'])}</td><td class='num'>{d['variants']}</td></tr>"
         for (s, cat), d in rule_rows
     ) or "<tr><td colspan='6' class='muted'>no actionable rules</td></tr>"
+    # Per-element drill-down — folds the per-engine dashboard's G-table into
+    # the combined report so element-level detail lives here, not in a second
+    # dashboard. Severity-ordered, capped to keep the export bounded.
+    _sev = {"blocker": 0, "major": 1, "minor": 2, "info": 3}
+    elem = "".join(
+        f"<tr><td>{esc(str(f.get('severity','')))}</td>"
+        f"<td class='mono'>{esc(str(f.get('category','')))}</td>"
+        f"<td>{esc(str(f.get('message',''))[:150])}</td>"
+        f"<td>{esc(str(f.get('device','')))}</td>"
+        f"<td>{esc(str(f.get('page','')))}</td>"
+        f"<td class='mono'>{esc(str(f.get('selector') or '—'))}</td></tr>"
+        for f in sorted(findings, key=lambda x: _sev.get(str(x.get('severity','')).lower(), 9))[:200]
+    ) or "<tr><td colspan='6' class='muted'>none</td></tr>"
+    _more = f"<p class='note'>Showing first 200 of {len(findings)}.</p>" if len(findings) > 200 else ""
+    elem_drill = (
+        f"<details class='drill'><summary>View all {len(findings)} per-element findings "
+        "(element · device · page · selector)</summary>"
+        "<table><thead><tr><th>Severity</th><th>Check</th><th>Element / issue</th>"
+        "<th>Device</th><th>Page</th><th>Selector</th></tr></thead>"
+        f"<tbody>{elem}</tbody></table>{_more}</details>"
+    )
     return (
         f"<div class='mob-strip'>"
         f"<div><span class='scv'>{mob if mob is not None else 'n/a'}</span><div class='sl'>Mobile score</div></div>"
@@ -621,8 +714,8 @@ def _render_mobile_compact(ed: EngineData) -> str:
         f"<th class='num'>Pages</th><th class='num'>Distinct elements</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
         f"<p class='note'>Grouped by <strong>rule</strong> (fix once → clear many): "
-        f"{len(rules)} rule(s) rolled up from {len(groups)} unique patterns / {len(findings)} raw findings. "
-        f"Per-element detail lives in the per-engine dashboard.</p>"
+        f"{len(rules)} rule(s) rolled up from {len(groups)} unique patterns / {len(findings)} raw findings.</p>"
+        f"{elem_drill}"
         f"<p class='note'>Mobile findings are <strong>engine-specific</strong> — counts differ between "
         f"engines because of executable checks, structural N/A (engine can't run them), and engine-specific "
         f"DOM/layout behaviour. Compare mobile across engines only via the Engine Comparison coverage matrix.</p>"
@@ -793,6 +886,16 @@ td.eng{white-space:nowrap}
 th.num,td.num{text-align:right}
 details.drill summary{cursor:pointer;font-weight:700;font-size:13px;color:#334155;padding:8px 0}
 details.drill[open] summary{margin-bottom:6px}
+.di-card{border:1px solid #e2e8f0;border-radius:10px;margin-bottom:8px;background:#fff;overflow:hidden}
+.di-card>summary{cursor:pointer;padding:10px 12px;font-size:12px;list-style:none;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.di-card>summary::-webkit-details-marker{display:none}
+.di-card[open]>summary{border-bottom:1px solid #eef2f7;background:#f8fafc}
+.di-cat{margin-left:auto;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.4px;color:#7c3aed;border:1px solid #ddd6fe;border-radius:999px;padding:1px 8px}
+.di-body{padding:12px;font-size:13px;line-height:1.5;color:#1e293b}
+.di-body>div{margin-bottom:6px}
+.di-sig code,.di-body code{background:#f1f5f9;border-radius:4px;padding:1px 5px;font-size:12px}
+.di-meta{color:#64748b;font-size:12px;border-top:1px dashed #e2e8f0;padding-top:6px}
+.di-shot{max-width:100%;max-height:420px;border:1px solid #cbd5e1;border-radius:8px;margin-top:8px;display:block}
 @media print{
   body{background:#fff}
   .container{max-width:none;padding:0}
