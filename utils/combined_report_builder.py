@@ -187,6 +187,13 @@ def load_engine(engine: str, base: str = "reports/trend") -> EngineData:
 # Small presentational helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _truncate_url(url: str, limit: int = 80) -> str:
+    """Hard string truncation for display — CSS max-width on a td doesn't
+    constrain table layout, so a long URL would blow the table out of its
+    card. Full URL stays in the cell's title tooltip."""
+    return url if len(url) <= limit else url[:limit] + "…"
+
+
 def _prov(engine: str, run_label: str, extra: str = "") -> str:
     """Provenance chip — engine + run timestamp on every metric/section."""
     colour = {"chromium": "#1a73e8", "webkit": "#8e44ad"}.get(engine, "#64748b")
@@ -964,7 +971,7 @@ def _render_login_routes(engines: list[EngineData]) -> str:
                 f"<td>{_prov(ed.engine, ed.run_label)}</td>"
                 f"<td class='mono'>{esc(str(r.get('test', '')))}</td>"
                 f"<td>{esc(badge)}</td>"
-                f"<td class='mono' style='max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{esc(str(r.get('url', '')))}</td>"
+                f"<td class='mono urlcell' title='{esc(str(r.get('url', '')))}'>{esc(_truncate_url(str(r.get('url', ''))))}</td>"
                 "</tr>"
             )
     table = (
@@ -986,7 +993,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .container{max-width:1180px;margin:0 auto;padding:24px}
 .report-title{font-size:22px;font-weight:800;margin-bottom:2px}
 .report-sub{color:#64748b;font-size:13px;margin-bottom:20px}
-.fg-section{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.fg-section{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.05);overflow-x:auto}
+td{word-break:break-word}
+td.urlcell{font-size:11px;word-break:break-all;max-width:420px}
+.di-meta a{word-break:break-all}
 .fg-sec-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;border-bottom:1px solid #eef2f7;padding-bottom:10px}
 h2{font-size:15px;font-weight:800;color:#0f172a;text-transform:uppercase;letter-spacing:.6px}
 h3.blk{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:#64748b;margin:16px 0 8px}
