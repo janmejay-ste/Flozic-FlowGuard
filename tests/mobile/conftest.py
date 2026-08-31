@@ -152,10 +152,26 @@ def _feature_for(test_name: str) -> str:
     return "Mobile"
 
 
-@pytest.fixture(autouse=True)
-def _record_mobile_outcome(request):
-    """Record every mobile test into the snapshot so the dashboard counts it."""
-    yield
+def _resolve_error_signature(node, failed: bool) -> str:
+    """Failure signature for a mobile test: the exception stashed by the root
+    makereport hook (mobile failures go through it too — this path just never
+    passed it on), with the same 'E '-line longrepr fallback as the root
+    recorder, so mobile failures cluster by cause like every other failure."""
+    sig = getattr(node, "_error_signature", "") or ""
+    if failed and not sig:
+        for phase in ("rep_call", "rep_setup"):
+            _r = getattr(node, phase, None)
+            if _r is not None and _r.failed and getattr(_r, "longrepr", None):
+                elines = [ln.lstrip("E ").strip()
+                          for ln in str(_r.longrepr).splitlines()
+                          if ln.lstrip().startswith("E ")]
+                if elines:
+                    return elines[-1][:300]
+    return sig
+
+
+def _record_mobile(request) -> None:
+    """Testable body of the autouse recorder (see _record_mobile_outcome)."""
     rep = getattr(request.node, "rep_call", None)
     failed = rep is not None and rep.failed
     if rep is None and getattr(request.node, "rep_setup", None) is not None:
@@ -163,6 +179,7 @@ def _record_mobile_outcome(request):
         failed = request.node.rep_setup.failed
     engine = request.config.getoption("--browser")
     cohort = "baseline-mobile" if engine == "chromium" else f"baseline-mobile-{engine}"
+    error_signature = _resolve_error_signature(request.node, failed)
     add_test_record(
         category="REGRESSION",
         login="Guest",                    # marketing pages need no session
@@ -173,4 +190,12 @@ def _record_mobile_outcome(request):
         duration_ms=int((rep.duration if rep else 0) * 1000),
         cohort=cohort,
         harness_fault=bool(getattr(request.node, "harness_fault", False)),
+        error_signature=error_signature,
     )
+
+
+@pytest.fixture(autouse=True)
+def _record_mobile_outcome(request):
+    """Record every mobile test into the snapshot so the dashboard counts it."""
+    yield
+    _record_mobile(request)
