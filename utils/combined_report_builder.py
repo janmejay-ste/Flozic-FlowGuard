@@ -204,14 +204,18 @@ def _prov(engine: str, run_label: str, extra: str = "") -> str:
     )
 
 
-def _section(sec_id: str, title: str, body: str, prov: str = "") -> str:
-    """Wrap a section with an id, a title, a provenance chip, and an
-    Export-PDF button that prints only this section."""
+def _section(sec_id: str, title: str, body: str, prov: str = "", export: bool = False) -> str:
+    """Wrap a section with an id, a title, a provenance chip and — only for the
+    large standalone sections — a per-section Export-PDF button (a button on
+    every section was visual noise; the header's Export Full Report covers the
+    rest)."""
+    btn = (f"<button class='fg-export-btn' onclick=\"exportSection('{sec_id}')\" "
+           "title='Export just this section to PDF'>⤓ Export PDF</button>") if export else ""
     return f"""
 <section class="fg-section" id="{sec_id}">
   <div class="fg-sec-head">
     <h2>{title} {prov}</h2>
-    <button class="fg-export-btn" onclick="exportSection('{sec_id}')" title="Export just this section to PDF">⤓ Export PDF</button>
+    {btn}
   </div>
   {body}
 </section>"""
@@ -404,8 +408,20 @@ def _render_exec_summary(engines: list[EngineData]) -> str:
         "<strong>not directly comparable</strong> — a higher number on a smaller scope is not a healthier product. "
         "See the coverage matrix in Engine Comparison.</div>"
     )
+    # Decisive approval verdict: READY only counts as approvable when it came
+    # from a full-suite run; a partial-scope pass stays provisional.
+    if overall == "READY":
+        verdict = ("READY FOR APPROVAL"
+                   if any(_is_full(ed.auth) and str((ed.auth or {}).get("status", "")).upper() == "READY"
+                          for ed in engines)
+                   else "PROVISIONAL — FULL SUITE REQUIRED BEFORE APPROVAL")
+    elif overall == "—":
+        verdict = "NO DECISION — NO COMPLETED RUN"
+    else:
+        verdict = "NOT READY FOR APPROVAL"
     return (
         f"<div class='rel-banner rel-{overall.lower()}'>RELEASE: {esc(overall)}"
+        f"<span class='rel-verdict'>{esc(verdict)}</span>"
         f"<span class='rel-why'>Release decision = {esc(overall)} because "
         f"{esc(_release_reason(engines, overall))}.</span></div>"
         f"{_render_primary_issue(engines)}"
@@ -540,7 +556,8 @@ def _load_failure_evidence(folder_name: str | None, embed_shot: bool) -> dict:
         try:
             t = json.loads(tj.read_text(encoding="utf-8"))
             ev.update(diagnosis=t.get("diagnosis"), suggested_fix=t.get("suggested_fix"),
-                      triage_category=t.get("category"), confidence=t.get("confidence"))
+                      triage_category=t.get("category"), confidence=t.get("confidence"),
+                      severity=t.get("severity"))
         except (OSError, ValueError):
             pass
     u = base / "url.txt"
@@ -578,9 +595,15 @@ def _render_combined_issues(engines: list[EngineData]) -> str:
             embedded += 1
         cat = ev.get("triage_category") or ("⚠ harness" if r.harness_fault else "unclassified")
         sig = (r.error_signature or "").strip()
+        # At-a-glance summary row: a dev should understand the failure WITHOUT
+        # expanding — issue phrase + severity + category, not just an identifier.
+        ftype = _failure_type(sig) if sig else "No signature captured"
+        sev = str(ev.get("severity") or "").lower()
+        sev_html = _sev_chip(sev) if sev in _SEV_CHIP else ""
         summary = (
             f"{_prov(ed.engine, ed.run_label)} "
             f"<code class='mono'>{esc(r.clazz)}::{esc(r.method)}</code> "
+            f"<span class='di-issue'>{esc(ftype.split(' — ')[0])}</span> {sev_html}"
             f"<span class='di-cat'>{esc(cat)}</span>"
         )
         body = []
@@ -924,6 +947,11 @@ def _render_mobile_compact(ed: EngineData) -> str:
         f"<div><span class='scv'>{sev['info']}</span><div class='sl'>Info</div></div>"
         f"<div><span class='scv'>{len(rules)}</span><div class='sl'>Rules</div></div>"
         f"</div>"
+        # Detail is collapsed so the two engine sections stay compact and
+        # non-repetitive: the strip answers "how bad", the accordion holds "what
+        # exactly" (rule table, per-element findings, AI triage).
+        f"<details class='drill'><summary>View mobile findings detail — {len(rules)} rule(s) · "
+        f"{len(findings)} finding(s) · AI triage</summary>"
         f"<table><thead><tr><th>Severity</th><th>Rule / check</th>"
         f"<th class='num'>Occurrences</th><th class='num'>Devices</th>"
         f"<th class='num'>Pages</th><th class='num'>Distinct elements</th><th>Recommended</th></tr></thead>"
@@ -935,6 +963,7 @@ def _render_mobile_compact(ed: EngineData) -> str:
         f"<details class='drill'><summary>🤖 AI Triage — "
         f"{len(((ed.mobile or {}).get('ai_triage') or {}).get('groups') or [])} group(s), "
         f"click to expand</summary>{_render_mobile_ai_triage(ed.mobile)}</details>"
+        f"</details>"
         f"<p class='note'>Mobile findings are <strong>engine-specific</strong> — counts differ between "
         f"engines because of executable checks, structural N/A (engine can't run them), and engine-specific "
         f"DOM/layout behaviour. Compare mobile across engines only via the Engine Comparison coverage matrix.</p>"
@@ -1073,10 +1102,12 @@ def _render_login_routes(engines: list[EngineData]) -> str:
 
 _CSS = """
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f1f5f9;color:#1e293b;line-height:1.45}
-.container{max-width:1180px;margin:0 auto;padding:24px}
-.report-title{font-size:22px;font-weight:800;margin-bottom:2px}
-.report-sub{color:#64748b;font-size:13px;margin-bottom:20px}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f1f5f9;color:#1e293b;line-height:1.5}
+.container{max-width:1640px;margin:0 auto;padding:24px 32px}
+.report-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:20px}
+.report-title{font-size:24px;font-weight:800;margin-bottom:2px}
+.report-sub{color:#64748b;font-size:14px}
+.fg-export-all{font-size:13px;padding:9px 16px}
 .fg-section{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.05);overflow-x:auto}
 td{word-break:break-word}
 td.urlcell{font-size:11px;word-break:break-all;max-width:420px}
@@ -1095,13 +1126,13 @@ table.ovr{margin:12px 0}
 table.ovr th{white-space:nowrap}
 table.ovr td:first-child{font-weight:600;color:#475569}
 tr.ovr-grp td{background:#f1f5f9;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.8px;color:#334155;padding:5px 10px}
-.note{color:#64748b;font-size:12px;margin-bottom:10px}
+.note{color:#64748b;font-size:13px;margin-bottom:10px}
 .muted{color:#94a3b8;font-style:italic}
 .mono,.feat{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 .feat{color:#64748b}
 .pending{background:#fffbeb;border:1px dashed #f59e0b;color:#92400e;border-radius:10px;padding:12px;font-size:13px}
 table{width:100%;border-collapse:collapse;border:1px solid #cbd5e1;margin-top:6px}
-th,td{border:1px solid #e2e8f0;padding:7px 10px;font-size:12px;text-align:left;vertical-align:top}
+th,td{border:1px solid #e2e8f0;padding:8px 12px;font-size:13px;text-align:left;vertical-align:top}
 th{background:#f8fafc;font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:#475569}
 table.exec td.sc{text-align:center;width:12%}
 .scv{font-size:24px;font-weight:800}.sl{font-size:10px;text-transform:uppercase;color:#64748b}.sb{font-size:10px;font-weight:700}
@@ -1155,7 +1186,9 @@ td.eng{white-space:nowrap}
 .hcard-b{font-size:10px;font-weight:700;margin-top:2px}
 @media(max-width:720px){.tiles{grid-template-columns:repeat(2,1fr)}.hcards{grid-template-columns:repeat(2,1fr)}}
 .rel-banner{border-radius:12px;padding:14px 18px;font-size:20px;font-weight:800;margin-bottom:16px;display:flex;flex-direction:column;gap:2px}
-.rel-banner .rel-why{font-size:11px;font-weight:600;opacity:.85;text-transform:none;letter-spacing:0}
+.rel-banner .rel-verdict{font-size:14px;font-weight:800;letter-spacing:.6px;margin-top:2px}
+.rel-banner .rel-why{font-size:12px;font-weight:600;opacity:.85;text-transform:none;letter-spacing:0}
+.di-issue{font-size:12px;font-weight:700;color:#b45309}
 .rel-banner.rel-blocked{background:#fee2e2;color:#991b1b;border:1px solid #fecaca}
 .rel-banner.rel-ready{background:#dcfce7;color:#166534;border:1px solid #bbf7d0}
 .rel-banner.rel-warning,.rel-banner.rel-at_risk,.rel-banner.rel-inconclusive{background:#fef3c7;color:#92400e;border:1px solid #fde68a}
@@ -1225,18 +1258,18 @@ def build(base: str = "reports/trend", out: Path | str = OUT_PATH) -> Path:
     # Chromium → WebKit → Detailed Issues (drill-down).
     sections = "".join([
         _section("sec-exec", "Executive Summary", _render_exec_summary(engines)),
-        _section("sec-compare", "Engine Comparison", _render_engine_comparison(chromium, webkit)),
+        _section("sec-compare", "Engine Comparison", _render_engine_comparison(chromium, webkit), export=True),
         _section("sec-systemic-failures", "Cross-Engine · Systemic Failures", _render_systemic_failures(engines)),
         _section("sec-systemic", "Cross-Engine · Failure Concentration", _render_systemic(engines)),
         _section("sec-recurring", "Cross-Engine · Failure History",
-                 _render_recurring(base), _prov("chromium", chromium.run_label, "run history")),
+                 _render_recurring(base), _prov("chromium", chromium.run_label, "run history"), export=True),
         _section("sec-login", "Cross-Engine · 🔐 Login Route Observations",
                  _render_login_routes(engines)),
         _section("sec-chromium", "Chromium", _render_engine_block(chromium),
-                 _prov("chromium", chromium.run_label)),
+                 _prov("chromium", chromium.run_label), export=True),
         _section("sec-webkit", "WebKit", _render_engine_block(webkit),
-                 _prov("webkit", webkit.run_label)),
-        _section("sec-issues", "Detailed Issues", _render_combined_issues(engines)),
+                 _prov("webkit", webkit.run_label), export=True),
+        _section("sec-issues", "Detailed Issues", _render_combined_issues(engines), export=True),
     ])
 
     html = f"""<!DOCTYPE html>
@@ -1245,8 +1278,13 @@ def build(base: str = "reports/trend", out: Path | str = OUT_PATH) -> Path:
 <title>Flozic FlowGuard — Combined Cross-Engine Report</title>
 <style>{_CSS}</style></head>
 <body><div class="container">
-  <div class="report-title">Flozic FlowGuard — Combined Cross-Engine Report</div>
-  <div class="report-sub">Hybrid layout · generated {generated} · each metric carries its own engine + run provenance</div>
+  <div class="report-head">
+    <div>
+      <div class="report-title">Flozic FlowGuard — Combined Cross-Engine Report</div>
+      <div class="report-sub">Hybrid layout · generated {generated} · each metric carries its own engine + run provenance</div>
+    </div>
+    <button class="fg-export-btn fg-export-all" onclick="window.print()" title="Export the whole report to PDF">⤓ Export Full Report</button>
+  </div>
   {sections}
 </div>
 <script>{_JS}</script>
