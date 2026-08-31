@@ -636,6 +636,55 @@ def _render_recurring(base: str) -> str:
     return body or "<p class='muted'>No recurring failures in the run history.</p>"
 
 
+# Deterministic recommendation per mobile check — the "what to do" a dev needs,
+# shown in a Recommended column throughout the mobile tables.
+_RECS = {
+    "tap_target": "Enlarge to ≥44×44px touch target",
+    "font_size": "Increase text to ≥12px (inputs ≥16px to avoid iOS zoom)",
+    "input_zoom": "Set input font-size ≥16px to stop iOS focus-zoom",
+    "horizontal_overflow": "Constrain width to the viewport; remove horizontal scroll",
+    "overflow": "Constrain width to the viewport; remove horizontal scroll",
+    "fixed_width": "Use a responsive width instead of a fixed px width",
+    "viewport_meta": "Add a proper responsive viewport meta tag",
+    "above_fold": "Ensure the element renders above the fold on small screens",
+    "cross_device": "Reconcile the layout difference across devices",
+}
+
+
+def _recommendation_for(category: str) -> str:
+    return _RECS.get(str(category).lower(), "Review against mobile UX guidelines")
+
+
+def _render_mobile_ai_triage(mobile: dict | None) -> str:
+    """AI triage of the mobile findings, read from the persisted
+    mobile-summary.ai_triage (advisory only — never affects severity/scoring).
+    Its suggested_fix is the recommendation for each issue group."""
+    t = (mobile or {}).get("ai_triage") or {}
+    groups = t.get("groups") or []
+    analysed, total = t.get("analysed_count"), t.get("total_count")
+    if not groups:
+        return ("<p class='muted'>AI triage unavailable for this run (no provider configured or analysis "
+                "failed). Classifications are advisory only; scoring is deterministic either way.</p>")
+    rows = "".join(
+        f"<tr><td class='mono'>{esc(str(g.get('id','')))}</td>"
+        f"<td><span class='di-cat'>{esc(str(g.get('classification','')))}</span></td>"
+        f"<td class='num'>{esc(str(g.get('confidence','')))}</td>"
+        f"<td>{esc(str(g.get('rationale','')))}</td>"
+        f"<td class='rec'>{esc(str(g.get('suggested_fix','')))}</td>"
+        f"<td>{esc(str(g.get('suggested_owner','')))}</td></tr>"
+        for g in groups
+    )
+    head = f" — analysed {analysed} of {total} group(s)" if analysed is not None else ""
+    summ = f"<p class='note'>{esc(str(t.get('summary','')))}</p>" if t.get("summary") else ""
+    return (
+        f"<p class='note'>AI triage (advisory — never moves severity or the score){head}. "
+        "The <strong>Recommended fix</strong> column is the AI's proposed action per issue group.</p>"
+        f"{summ}<table><thead><tr><th>Group</th><th>Classification</th><th class='num'>Conf.</th>"
+        "<th>Rationale</th><th>Recommended fix</th><th>Owner</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table>"
+    )
+
+
 def _render_mobile_compact(ed: EngineData) -> str:
     """Light mobile view: authoritative score + coverage + severity counts +
     top issue patterns. Avoids the full 400-row raw findings table (which made
@@ -674,9 +723,10 @@ def _render_mobile_compact(ed: EngineData) -> str:
     rows = "".join(
         f"<tr><td>{esc(s)}</td><td class='mono'>{esc(cat)}</td>"
         f"<td class='num'>{d['occ']}</td><td class='num'>{len(d['devices'])}</td>"
-        f"<td class='num'>{len(d['pages'])}</td><td class='num'>{d['variants']}</td></tr>"
+        f"<td class='num'>{len(d['pages'])}</td><td class='num'>{d['variants']}</td>"
+        f"<td class='rec'>{esc(_recommendation_for(cat))}</td></tr>"
         for (s, cat), d in rule_rows
-    ) or "<tr><td colspan='6' class='muted'>no actionable rules</td></tr>"
+    ) or "<tr><td colspan='7' class='muted'>no actionable rules</td></tr>"
     # Per-element drill-down — folds the per-engine dashboard's G-table into
     # the combined report so element-level detail lives here, not in a second
     # dashboard. Severity-ordered, capped to keep the export bounded.
@@ -687,15 +737,16 @@ def _render_mobile_compact(ed: EngineData) -> str:
         f"<td>{esc(str(f.get('message',''))[:150])}</td>"
         f"<td>{esc(str(f.get('device','')))}</td>"
         f"<td>{esc(str(f.get('page','')))}</td>"
-        f"<td class='mono'>{esc(str(f.get('selector') or '—'))}</td></tr>"
+        f"<td class='mono'>{esc(str(f.get('selector') or '—'))}</td>"
+        f"<td class='rec'>{esc(_recommendation_for(f.get('category','')))}</td></tr>"
         for f in sorted(findings, key=lambda x: _sev.get(str(x.get('severity','')).lower(), 9))[:200]
-    ) or "<tr><td colspan='6' class='muted'>none</td></tr>"
+    ) or "<tr><td colspan='7' class='muted'>none</td></tr>"
     _more = f"<p class='note'>Showing first 200 of {len(findings)}.</p>" if len(findings) > 200 else ""
     elem_drill = (
         f"<details class='drill'><summary>View all {len(findings)} per-element findings "
-        "(element · device · page · selector)</summary>"
+        "(element · device · page · selector · recommended)</summary>"
         "<table><thead><tr><th>Severity</th><th>Check</th><th>Element / issue</th>"
-        "<th>Device</th><th>Page</th><th>Selector</th></tr></thead>"
+        "<th>Device</th><th>Page</th><th>Selector</th><th>Recommended</th></tr></thead>"
         f"<tbody>{elem}</tbody></table>{_more}</details>"
     )
     return (
@@ -711,11 +762,13 @@ def _render_mobile_compact(ed: EngineData) -> str:
         f"</div>"
         f"<table><thead><tr><th>Severity</th><th>Rule / check</th>"
         f"<th class='num'>Occurrences</th><th class='num'>Devices</th>"
-        f"<th class='num'>Pages</th><th class='num'>Distinct elements</th></tr></thead>"
+        f"<th class='num'>Pages</th><th class='num'>Distinct elements</th><th>Recommended</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
         f"<p class='note'>Grouped by <strong>rule</strong> (fix once → clear many): "
-        f"{len(rules)} rule(s) rolled up from {len(groups)} unique patterns / {len(findings)} raw findings.</p>"
+        f"{len(rules)} rule(s) rolled up from {len(groups)} unique patterns / {len(findings)} raw findings. "
+        "The <strong>Recommended</strong> column is the fix for each check.</p>"
         f"{elem_drill}"
+        f"<h4 class='blk'>AI Triage</h4>{_render_mobile_ai_triage(ed.mobile)}"
         f"<p class='note'>Mobile findings are <strong>engine-specific</strong> — counts differ between "
         f"engines because of executable checks, structural N/A (engine can't run them), and engine-specific "
         f"DOM/layout behaviour. Compare mobile across engines only via the Engine Comparison coverage matrix.</p>"
@@ -802,8 +855,8 @@ def _render_engine_block(ed: EngineData) -> str:
     else:
         js = _pending("JS Error Clusters", "utils/health_tracker.get_clusters()")
     return (
-        f"{_stat_tiles(ed.records)}"
         f"<h3 class='blk'>Health Score</h3>{_health_cards(ed)}"
+        f"<h3 class='blk'>Test Results</h3>{_stat_tiles(ed.records)}"
         f"<h3 class='blk'>Mobile</h3>{_render_mobile_compact(ed)}"
         f"<h3 class='blk'>JS Errors</h3>{js}"
     )
@@ -862,6 +915,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .fg-sec-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;border-bottom:1px solid #eef2f7;padding-bottom:10px}
 h2{font-size:15px;font-weight:800;color:#0f172a;text-transform:uppercase;letter-spacing:.6px}
 h3.blk{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:#64748b;margin:16px 0 8px}
+h4.blk{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:#7c3aed;margin:14px 0 6px}
+td.rec{color:#166534;background:#f0fdf4;font-size:12px;font-weight:600}
+th:last-child{white-space:nowrap}
 .fg-export-btn{border:1px solid #cbd5e1;background:#f8fafc;color:#334155;font-size:12px;font-weight:600;padding:6px 12px;border-radius:8px;cursor:pointer;white-space:nowrap}
 .fg-export-btn:hover{background:#eef2f7}
 .prov{display:inline-block;border:1px solid;border-radius:999px;padding:1px 8px;font-size:10px;font-weight:700;vertical-align:middle;background:#fff}
