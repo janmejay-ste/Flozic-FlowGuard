@@ -566,6 +566,18 @@ def _load_failure_evidence(folder_name: str | None, embed_shot: bool) -> dict:
             ev["url"] = u.read_text(encoding="utf-8").strip()[:400]
         except OSError:
             pass
+    # Network digest — the "did the backend fail?" signal. Captured per failure
+    # in network-summary.json but previously never surfaced in the report.
+    nsf = base / "network-summary.json"
+    if nsf.is_file():
+        try:
+            ns = json.loads(nsf.read_text(encoding="utf-8"))
+            bad = {k: v for k, v in (ns.get("by_status") or {}).items()
+                   if not str(k).startswith(("2", "3"))}
+            ev["net"] = {"failed": ns.get("failed_count", 0),
+                         "total": ns.get("total_requests", 0), "bad": bad}
+        except (OSError, ValueError):
+            pass
     if embed_shot:
         sc = base / "screenshot.png"
         if sc.is_file():
@@ -615,6 +627,13 @@ def _render_combined_issues(engines: list[EngineData]) -> str:
             body.append(f"<div><strong>Diagnosis:</strong> {esc(str(ev['diagnosis']))}</div>")
         if ev.get("suggested_fix"):
             body.append(f"<div><strong>Suggested fix:</strong> {esc(str(ev['suggested_fix']))}</div>")
+        if ev.get("net"):
+            n = ev["net"]
+            bad = ", ".join(f"{v}× {k}" for k, v in n["bad"].items()) or "no 4xx/5xx"
+            body.append(
+                f"<div><strong>Network during test:</strong> {n['failed']}/{n['total']} "
+                f"requests failed ({esc(bad)}) — full request/response bodies in the "
+                "failure folder's network-events.json.</div>")
         meta = [f"feature: {esc(r.feature)}", f"engine: {esc(ed.engine)}"]
         if ev.get("url"):
             meta.append(f"page: <a href='{esc(ev['url'])}' target='_blank' rel='noopener'>{esc(ev['url'])}</a>")
@@ -705,7 +724,13 @@ def _render_primary_issue(engines: list[EngineData]) -> str:
             f"<div class='primary-m'><span><strong>{top.affected_tests}</strong> affected test(s)</span>"
             f"<span>engine: {esc(', '.join(top.engines) or '—')}</span>"
             f"<span>confidence: {esc(top.confidence)}</span></div>"
-            f"<div class='primary-a'><strong>Recommended action:</strong> {esc(_action_for_type(ftype))}</div></div>"
+            # Observed vs inferred are kept apart on purpose: the signature match
+            # is proven; the cause is not — naming a root cause here would
+            # overclaim exactly the way the scoring engine never does.
+            f"<div class='primary-a'><strong>Confirmed:</strong> {top.affected_tests} independent tests "
+            f"share this normalized failure signature ({esc(', '.join(top.engines) or '—')}).</div>"
+            f"<div class='primary-a'><strong>Suggested investigation (cause not yet proven):</strong> "
+            f"{esc(_action_for_type(ftype))}</div></div>"
         )
     # No signature cluster — fall back to the biggest feature concentration.
     by_feat: dict[tuple, int] = {}
@@ -719,6 +744,63 @@ def _render_primary_issue(engines: list[EngineData]) -> str:
         "<span>no shared signature — causes may differ</span></div>"
         "<div class='primary-a'><strong>Recommended action:</strong> review the failure "
         "evidence cards in Detailed Issues.</div></div>"
+    )
+
+
+def _render_dev_actions(engines: list[EngineData]) -> str:
+    """Developer Action Required — a prioritized work list, first thing after
+    the Executive Summary. P0 = signature-matched systemic clusters, P1 =
+    other signed failure groups, P2 = the biggest mobile rule. All derived
+    deterministically from the run's data."""
+    from utils.failure_clustering import detect_systemic, normalize_message
+    fail_records, signed = _collect_fail_records(engines)
+    rows = []
+    clustered_methods: set[str] = set()
+    if signed:
+        for s in detect_systemic(fail_records, min_tests=3):
+            clustered_methods.update(s.test_methods)
+            ftype = _failure_type(s.sample_message)
+            rows.append(("P0", f"{ftype.split(' — ')[0]} — {', '.join(s.sample_features[:2])}",
+                         f"{s.affected_tests} tests", ", ".join(s.engines),
+                         _action_for_type(ftype)))
+    # P1: signed failures outside the clusters, grouped by signature.
+    rest: dict[str, list[dict]] = {}
+    for r in fail_records:
+        if r["method"] in clustered_methods or not r["errorSignature"]:
+            continue
+        rest.setdefault(normalize_message(r["errorSignature"]), []).append(r)
+    for sig, rs in sorted(rest.items(), key=lambda kv: -len(kv[1]))[:5]:
+        ftype = _failure_type(rs[0]["errorSignature"])
+        feats = sorted({x["feature"] for x in rs if x["feature"]})[:2]
+        engs = sorted({x["engine"] for x in rs})
+        rows.append(("P1", f"{ftype.split(' — ')[0]} — {', '.join(feats) or rs[0]['method'].split('::')[-1]}",
+                     f"{len({x['method'] for x in rs})} test(s)", ", ".join(engs),
+                     _action_for_type(ftype)))
+    # P2: the biggest mobile rule across engines.
+    rule_occ: dict[str, int] = {}
+    for ed in engines:
+        for f in (ed.mobile or {}).get("findings") or []:
+            if str(f.get("severity", "")).lower() in ("blocker", "major", "minor"):
+                cat = str(f.get("category", ""))
+                rule_occ[cat] = rule_occ.get(cat, 0) + 1
+    if rule_occ:
+        cat, n = max(rule_occ.items(), key=lambda kv: kv[1])
+        rows.append(("P2", f"Mobile: {cat}", f"{n} occurrences", "mobile scan",
+                     _recommendation_for(cat)))
+    if not rows:
+        return ""
+    body = "".join(
+        f"<tr><td><span class='pri pri-{p.lower()}'>{p}</span></td><td>{esc(issue)}</td>"
+        f"<td class='num'>{esc(impact)}</td><td>{esc(evid)}</td><td class='rec'>{esc(act)}</td></tr>"
+        for p, issue, impact, evid, act in rows
+    )
+    return (
+        "<p class='note'>Prioritized from this run's data: P0 = signature-matched systemic clusters, "
+        "P1 = other signed failure groups, P2 = largest mobile rule. Evidence for each row is in "
+        "Detailed Issues / the Mobile sections.</p>"
+        "<table><thead><tr><th>Priority</th><th>Issue group</th><th class='num'>Impact</th>"
+        "<th>Evidence</th><th>Recommended investigation</th></tr></thead>"
+        f"<tbody>{body}</tbody></table>"
     )
 
 
@@ -781,6 +863,13 @@ def _render_systemic_failures(engines: list[EngineData]) -> str:
         )
 
     conf_color = {"High": "#b91c1c", "Medium": "#92400e", "Low": "#64748b"}
+    # method -> (engine, record) for failures that have an evidence folder,
+    # so each cluster can show one representative failure with real evidence.
+    rep_lookup: dict[str, tuple] = {}
+    for ed in engines:
+        for r in ed.records:
+            if r.status == "FAIL" and r.artifact_folder:
+                rep_lookup.setdefault(f"{r.clazz}::{r.method}", (ed, r))
     cards = []
     for s in systemic:
         col = conf_color.get(s.confidence, "#64748b")
@@ -788,11 +877,32 @@ def _render_systemic_failures(engines: list[EngineData]) -> str:
         if len(s.test_methods) > 30:
             methods += f"<li class='muted'>+{len(s.test_methods) - 30} more</li>"
         ftype = _failure_type(s.sample_message)
+        # One representative failure with real evidence, so a dev doesn't have
+        # to scroll 42 test names to start investigating.
+        rep_html = ""
+        rep_method = next((m for m in s.test_methods if m in rep_lookup), None)
+        if rep_method:
+            ed_rep, r_rep = rep_lookup[rep_method]
+            rev = _load_failure_evidence(r_rep.artifact_folder, embed_shot=False)
+            bits = [f"<code class='mono'>{esc(rep_method)}</code> ({esc(ed_rep.engine)})"]
+            if rev.get("url"):
+                bits.append(f"page: <a href='{esc(rev['url'])}' target='_blank' rel='noopener'>"
+                            f"{esc(_truncate_url(rev['url'], 70))}</a>")
+            if rev.get("diagnosis"):
+                bits.append(f"diagnosis: {esc(str(rev['diagnosis'])[:160])}")
+            if rev.get("net"):
+                n = rev["net"]
+                bad = ", ".join(f"{v}× {k}" for k, v in n["bad"].items()) or "no 4xx/5xx"
+                bits.append(f"network: {n['failed']}/{n['total']} failed ({esc(bad)})")
+            rep_html = ("<div class='sysfail-rep'><strong>Representative failure:</strong> "
+                        + " · ".join(bits)
+                        + " — full evidence (screenshot, DOM, network bodies) in its Detailed Issues card.</div>")
         cards.append(
             "<div class='sysfail'>"
-            f"<div class='sysfail-interp'><strong>{esc(ftype)}</strong> — affects "
-            f"<strong>{s.affected_tests}</strong> test(s) in {esc(', '.join(s.sample_features[:3]) or '—')}. "
-            f"{esc(_action_for_type(ftype))}</div>"
+            f"<div class='sysfail-interp'><strong>Confirmed:</strong> {s.affected_tests} independent test(s) "
+            f"in {esc(', '.join(s.sample_features[:3]) or '—')} share this normalized signature — {esc(ftype)}. "
+            f"<strong>Suggested investigation (cause not yet proven):</strong> {esc(_action_for_type(ftype))}</div>"
+            f"{rep_html}"
             f"<div class='sysfail-head'><span class='sysfail-sig'>“{esc(s.sample_message[:120])}”</span>"
             f"<span class='sysfail-conf' style='color:{col};border-color:{col}'>{esc(s.confidence)} confidence</span></div>"
             f"<div class='sysfail-stats'>"
@@ -1183,6 +1293,9 @@ td.eng{white-space:nowrap}
 .conc-bar{height:8px;border-radius:4px;background:#f1f5f9;margin-top:3px}
 .conc-fill{height:8px;border-radius:4px;background:#f87171}
 .sysfail-interp{font-size:13px;color:#1e293b;background:#fff;border:1px solid #fecaca;border-radius:8px;padding:8px 10px;margin-bottom:8px}
+.sysfail-rep{font-size:12px;color:#334155;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:8px 10px;margin-bottom:8px}
+.pri{display:inline-block;border-radius:6px;padding:2px 10px;font-size:11px;font-weight:800}
+.pri-p0{background:#fee2e2;color:#b91c1c}.pri-p1{background:#fef3c7;color:#92400e}.pri-p2{background:#e0e7ff;color:#3730a3}
 .sysfail{border:1px solid #fecaca;background:#fef2f2;border-radius:10px;padding:12px;margin-bottom:10px}
 .sysfail-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
 .sysfail-sig{font-family:ui-monospace,Menlo,monospace;font-size:13px;font-weight:700;color:#7f1d1d}
@@ -1301,6 +1414,7 @@ def build(base: str = "reports/trend", out: Path | str = OUT_PATH) -> Path:
     # Chromium → WebKit → Detailed Issues (drill-down).
     sections = "".join([
         _section("sec-exec", "Executive Summary", _render_exec_summary(engines)),
+        _section("sec-dev-actions", "🛠 Developer Action Required", _render_dev_actions(engines), export=True),
         _section("sec-compare", "Engine Comparison", _render_engine_comparison(chromium, webkit), export=True),
         _section("sec-systemic-failures", "Cross-Engine · Systemic Failures", _render_systemic_failures(engines)),
         _section("sec-systemic", "Cross-Engine · Failure Concentration", _render_systemic(engines)),
