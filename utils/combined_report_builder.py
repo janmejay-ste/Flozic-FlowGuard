@@ -86,12 +86,14 @@ def _engine_root(engine: str, base: str) -> str:
     return base if engine == "chromium" else os.path.join(base, engine)
 
 
-def _load_trend_auth(root: str) -> dict | None:
-    """Latest COMPLETED (total>0) trend-history row for this engine — the
-    AUTHORITATIVE overall/mobile/status the real run computed in-session.
-    We read these rather than recompute, because Product/Infra/Framework
-    health depend on in-session JS ErrorClusters that snapshots don't persist,
-    so a recompute would silently disagree with the real dashboard.
+def _load_trend_auth(root: str, anchor_ms: int | None = None) -> dict | None:
+    """AUTHORITATIVE overall/mobile/status row from trend history — read, never
+    recomputed (Product/Infra/Framework depend on in-session JS ErrorClusters
+    that snapshots don't persist).
+
+    When anchor_ms is given (the full-suite sidecar's run start), the row for
+    THAT run is preferred, so a later subset run's row cannot displace the
+    full-run scores. Falls back to the latest total>0 row.
     """
     path = os.path.join(root, "trend-history.json")
     try:
@@ -100,6 +102,10 @@ def _load_trend_auth(root: str) -> dict | None:
         return None
     rows = rows if isinstance(rows, list) else rows.get("entries", [])
     good = [r for r in rows if (r.get("total") or 0) > 0]
+    if anchor_ms:
+        anchored = next((r for r in good if r.get("ts") == anchor_ms), None)
+        if anchored:
+            return anchored
     return good[-1] if good else None
 
 
@@ -135,13 +141,33 @@ def load_engine(engine: str, base: str = "reports/trend") -> EngineData:
     root = _engine_root(engine, base)
     ed = EngineData(engine=engine)
 
-    # Pick the latest NON-EMPTY snapshot. A pytest session always archives a
-    # snapshot at teardown — including unit-only runs that executed 0 browser
-    # tests — so the newest file on disk may be an EMPTY run. Reading that would
-    # wipe this engine's data in the report; skip EMPTY snapshots (same
-    # run-hygiene rule the trend/flake layers follow).
+    # Sidecar first: report-data.json is written ONLY by full-suite runs (a
+    # partial run writes report-data-partial.json), so it names the ANCHOR RUN
+    # this engine's view is built from. Fall back to the partial sidecar when
+    # no full run has ever been recorded.
+    ed.sidecar = None
+    for name in ("report-data.json", "report-data-partial.json"):
+        p = os.path.join(root, name)
+        if os.path.isfile(p):
+            try:
+                ed.sidecar = json.load(open(p, encoding="utf-8"))
+                break
+            except (OSError, ValueError):
+                continue
+    anchor_ms = (ed.sidecar or {}).get("run_started_at")
+
+    # Snapshot: prefer the one belonging to the ANCHOR run (archive stems are
+    # the run's start time), so tiles/failures/evidence describe the same run
+    # as the health scores — a later subset run cannot desync them. Fall back
+    # to the latest NON-EMPTY snapshot (a pytest session always archives one,
+    # including unit-only sessions, so the newest file may be EMPTY junk).
     snaps = sorted(glob.glob(os.path.join(root, "snapshots", "*.json")), key=os.path.getmtime)
-    for snap in reversed(snaps):
+    anchor_snap = None
+    if anchor_ms:
+        stem = datetime.fromtimestamp(anchor_ms / 1000).strftime("%Y%m%d_%H%M%S")
+        anchor_snap = next((s for s in snaps if os.path.basename(s).startswith(stem)), None)
+    ordered = ([anchor_snap] if anchor_snap else []) + list(reversed(snaps))
+    for snap in ordered:
         recs, run_ms = _records_from_snapshot(snap)
         if recs:
             ed.snapshot_path, ed.records, ed.run_ms, ed.present = snap, recs, run_ms, True
@@ -151,6 +177,8 @@ def load_engine(engine: str, base: str = "reports/trend") -> EngineData:
             ed.snapshot_path = snaps[-1]
             _, ed.run_ms = _records_from_snapshot(snaps[-1])
 
+    # Mobile summary is deliberately NOT anchored: a fresh mobile-only run
+    # legitimately refreshes it, and it carries its own generated_at provenance.
     ms_path = os.path.join(root, "mobile-summary.json")
     if os.path.isfile(ms_path):
         try:
@@ -158,14 +186,7 @@ def load_engine(engine: str, base: str = "reports/trend") -> EngineData:
         except (OSError, ValueError):
             ed.mobile = None
 
-    sc_path = os.path.join(root, "report-data.json")
-    if os.path.isfile(sc_path):
-        try:
-            ed.sidecar = json.load(open(sc_path, encoding="utf-8"))
-        except (OSError, ValueError):
-            ed.sidecar = None
-
-    ed.auth = _load_trend_auth(root)
+    ed.auth = _load_trend_auth(root, anchor_ms=anchor_ms)
 
     # Recompute layered scores from what we have (records + mobile findings/coverage).
     if ed.present:

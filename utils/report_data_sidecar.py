@@ -203,12 +203,24 @@ def build_sidecar(
     }
 
 
-def write_sidecar(root: Path | str, payload: dict[str, Any]) -> Path | None:
-    """Write report-data.json under `root`. Never raises into the run."""
+PARTIAL_FILENAME = "report-data-partial.json"
+
+
+def write_sidecar(root: Path | str, payload: dict[str, Any],
+                  filename: str | None = None) -> Path | None:
+    """Write the sidecar under `root`. Never raises into the run.
+
+    filename=None routes by suite: FULL-suite runs own report-data.json (the
+    authoritative record the combined report anchors to); partial runs write
+    report-data-partial.json so a mobile-only or subset run can NEVER displace
+    the full-run record — the clobber that repeatedly degraded the report."""
     try:
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
-        path = root / FILENAME
+        if filename is None:
+            suite = (payload.get("population") or {}).get("suite")
+            filename = FILENAME if suite == "full" else PARTIAL_FILENAME
+        path = root / filename
         # Atomic swap: the other engine's parallel rebuild reads this sidecar —
         # it must see the previous complete version or this one, never a partial.
         from utils.atomic_io import atomic_write_json
