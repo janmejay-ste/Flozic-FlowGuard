@@ -182,8 +182,10 @@ def _append_trend(stats: dict, decision: Any, started_at_ms: int,
 
     # Keep last 30 runs
     history = history[-30:]
-    TREND_JSON.parent.mkdir(parents=True, exist_ok=True)
-    TREND_JSON.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    # Atomic: the other engine's parallel rebuild reads this trend file for the
+    # authoritative overall/mobile scores — never let it see a partial write.
+    from utils.atomic_io import atomic_write_json
+    atomic_write_json(TREND_JSON, history)
 
 
 def _load_trend() -> list[dict]:

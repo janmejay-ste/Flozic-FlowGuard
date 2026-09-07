@@ -209,7 +209,10 @@ def write_sidecar(root: Path | str, payload: dict[str, Any]) -> Path | None:
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
         path = root / FILENAME
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Atomic swap: the other engine's parallel rebuild reads this sidecar —
+        # it must see the previous complete version or this one, never a partial.
+        from utils.atomic_io import atomic_write_json
+        atomic_write_json(path, payload)
         logger.info("[report-data] wrote %s (schema v%d, status=%s)",
                     path, payload.get("schema_version"), payload.get("execution_status"))
         return path

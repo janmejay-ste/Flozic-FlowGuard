@@ -1458,13 +1458,18 @@ def build(base: str = "reports/trend", out: Path | str = OUT_PATH) -> Path:
 <script>{_JS}</script>
 </body></html>"""
 
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(html, encoding="utf-8")
+    # Atomic swaps: two parallel teardowns may rebuild concurrently, and a
+    # browser may refresh mid-write — readers must always see a complete page.
+    # Note the rebuild is INCREMENTAL by design: it re-reads BOTH engines'
+    # persisted data every time, so engine B's rebuild carries engine A's
+    # completed results forward — it can never erase them.
+    from utils.atomic_io import atomic_write_text
+    atomic_write_text(out, html)
     # Also write index.html so the combined report is the DEFAULT landing page:
     # opening reports/trend/ (or the server root) now lands on the cross-engine
     # view rather than a per-engine dashboard.
     try:
-        (out.parent / "index.html").write_text(html, encoding="utf-8")
+        atomic_write_text(out.parent / "index.html", html)
     except Exception:
         pass
     return out

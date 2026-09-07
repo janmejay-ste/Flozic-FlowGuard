@@ -164,15 +164,16 @@ class MobileReportCollector:
 
     def write_summary(self, base="reports/trend") -> str:
         path = self.summary_path(base)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as fh:
-            json.dump({"schema_version": 1, **self.summary(),
-                       # Additive: {attempted, executed} for THIS engine, so
-                       # cross-engine readers can show "% executed" without
-                       # mistaking untested checks for clean ones. None when
-                       # nothing was instrumented (e.g. layout-only sessions).
-                       "check_stats": session_check_stats().get(self.engine),
-                       "findings": self._sorted_findings()}, fh, indent=2)
+        # Atomic: the OTHER engine's parallel teardown reads this file to build
+        # the combined report — it must never observe a half-written summary.
+        from utils.atomic_io import atomic_write_json
+        atomic_write_json(path, {"schema_version": 1, **self.summary(),
+                                 # Additive: {attempted, executed} for THIS engine, so
+                                 # cross-engine readers can show "% executed" without
+                                 # mistaking untested checks for clean ones. None when
+                                 # nothing was instrumented (e.g. layout-only sessions).
+                                 "check_stats": session_check_stats().get(self.engine),
+                                 "findings": self._sorted_findings()})
         return path
 
     def report_dir(self, base="reports/mobile") -> str:
