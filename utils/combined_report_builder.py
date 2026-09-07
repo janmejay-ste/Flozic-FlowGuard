@@ -656,7 +656,13 @@ def _render_combined_issues(engines: list[EngineData]) -> str:
         f"straight from this report. {embedded} screenshot(s) embedded (cap {_MAX_EMBEDDED_SHOTS}) to keep the "
         "export self-contained yet bounded.</p>"
     )
-    return intro + "".join(cards)
+    # Whole list collapsed by default — 88 cards is a long scroll; the section
+    # opens on click (and auto-expands on section export).
+    return (
+        intro
+        + f"<details class='drill'><summary>View all {len(fails)} failing tests with evidence</summary>"
+        + "".join(cards) + "</details>"
+    )
 
 
 def _failure_type(signature: str) -> str:
@@ -1175,7 +1181,9 @@ def _render_engine_block(ed: EngineData) -> str:
     if not ed.present:
         return f"<p class='muted'>No persisted run for {esc(ed.engine)}.</p>"
     if ed.sidecar is not None and "js_error_clusters" in ed.sidecar:
-        js = _render_js_clusters(ed.sidecar.get("js_error_clusters") or [])
+        clusters = ed.sidecar.get("js_error_clusters") or []
+        js = (f"<details class='drill'><summary>View JS error clusters ({len(clusters)})</summary>"
+              f"{_render_js_clusters(clusters)}</details>")
     else:
         js = _pending("JS Error Clusters", "utils/health_tracker.get_clusters()")
     return (
@@ -1216,11 +1224,14 @@ def _render_login_routes(engines: list[EngineData]) -> str:
                 f"<td class='mono urlcell' title='{esc(str(r.get('url', '')))}'>{esc(_truncate_url(str(r.get('url', ''))))}</td>"
                 "</tr>"
             )
+    if not rows:
+        return "<p class='muted'>No login-route observations in the persisted engine(s).</p>" + pending_note
+    # Collapsed by default — the table only renders open on click (or on export,
+    # which auto-expands the section's details).
     table = (
-        "<p class='muted'>No login-route observations in the persisted engine(s).</p>"
-        if not rows else
+        f"<details class='drill'><summary>View {len(rows)} login-route observation(s)</summary>"
         "<table><thead><tr><th>Engine</th><th>Test</th><th>Route</th><th>URL</th></tr></thead>"
-        f"<tbody>{''.join(rows)}</tbody></table>"
+        f"<tbody>{''.join(rows)}</tbody></table></details>"
     )
     return table + pending_note
 
