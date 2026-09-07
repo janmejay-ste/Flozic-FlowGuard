@@ -149,11 +149,26 @@ class MobileLayoutAuditor:
             (maxEls) => {
               const sel = 'a, button, input, select, [role="button"]';
               const els = Array.from(document.querySelectorAll(sel)).slice(0, maxEls);
+              // Build a dev-greppable CSS selector: prefer #id, then a data-testid,
+              // else tag + up to two classes (+ href hint for anchors). This is for
+              // LOCATING the element in code, not a guaranteed-unique locator.
+              const cssFor = (el) => {
+                if (el.id) return '#' + el.id;
+                const dt = el.getAttribute('data-testid') || el.getAttribute('data-test');
+                if (dt) return `[data-testid="${dt}"]`;
+                let s = el.tagName.toLowerCase();
+                const cls = (el.className || '').toString().trim().split(/\\s+/).filter(Boolean).slice(0, 2);
+                if (cls.length) s += '.' + cls.join('.');
+                if (el.tagName === 'A' && el.getAttribute('href'))
+                  s += `[href="${el.getAttribute('href').slice(0, 60)}"]`;
+                return s;
+              };
               return els.map(el => {
                 const r = el.getBoundingClientRect();
                 const style = getComputedStyle(el);
                 const visible = style.display !== 'none' && style.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-                return {tag: el.tagName, text: (el.innerText || el.value || '').trim().slice(0, 40), w: r.width, h: r.height, visible};
+                return {tag: el.tagName, text: (el.innerText || el.value || '').trim().slice(0, 40),
+                        w: r.width, h: r.height, visible, sel: cssFor(el).slice(0, 120)};
               });
             }
             """,
@@ -168,6 +183,7 @@ class MobileLayoutAuditor:
                     f"{el['tag']} '{el['text']}' is {el['w']:.0f}x{el['h']:.0f}px on "
                     f"{self.device_name} — below the {self.MIN_TAP_TARGET_PX}px recommended "
                     f"minimum touch-target size.",
+                    selector=el.get("sel"),
                 )
 
     def check_font_sizes(self):

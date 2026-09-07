@@ -58,6 +58,10 @@ class TestRecord:
     # the emitted JSON is a schema-3 contract shared with the Java side and
     # this flag is for local scoring, not cross-stack exchange.
     harness_fault: bool = False
+    # Raw first line of the failure (assertion/exception). Persisted for FAILs
+    # so cross-run + within-run SYSTEMIC clustering can group by NORMALIZED
+    # signature rather than by feature name. Empty for passing tests.
+    error_signature: str = ""
 
 
 @dataclass
@@ -84,6 +88,7 @@ def add_test_record(
     video_path: str | None = None,
     cohort: str = "baseline",
     harness_fault: bool = False,
+    error_signature: str = "",
 ) -> None:
     """Record one test result. Thread-safe."""
     with _STATE.lock:
@@ -100,6 +105,7 @@ def add_test_record(
                 video_path=video_path,
                 cohort=cohort,
                 harness_fault=harness_fault,
+                error_signature=error_signature,
             )
         )
 
@@ -165,4 +171,8 @@ def _test_record_to_json(r: TestRecord) -> dict[str, Any]:
         out["artifacts"] = r.artifact_folder
     if r.video_path is not None:
         out["videoPath"] = r.video_path
+    # Only emitted for failures — keeps the passing-test JSON identical to the
+    # schema-3 contract; consumers that don't know the field simply ignore it.
+    if r.error_signature:
+        out["errorSignature"] = r.error_signature
     return out

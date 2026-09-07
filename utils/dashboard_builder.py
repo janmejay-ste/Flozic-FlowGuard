@@ -29,6 +29,35 @@ logger = logging.getLogger(__name__)
 DASHBOARD_PATH = Path("reports/trend/dashboard.html")
 TREND_JSON     = Path("reports/trend/trend-history.json")
 
+# The per-engine dashboards are consolidated into the Combined Cross-Engine
+# Report. build() emits a redirect stub instead of the full dashboard; set this
+# True to restore the legacy per-engine page.
+EMIT_FULL_DASHBOARD = False
+
+
+def _redirect_stub_html() -> str:
+    """A tiny page that forwards the (now-retired) per-engine dashboard to the
+    combined report. Computes a relative href from THIS engine's location
+    (chromium: sibling; webkit: ../)."""
+    import os as _os
+    try:
+        href = _os.path.relpath(Path("reports/trend/combined-report.html"), DASHBOARD_PATH.parent)
+    except Exception:
+        href = "combined-report.html"
+    return (
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+        f"<meta http-equiv=\"refresh\" content=\"0; url={href}\">"
+        "<title>Flozic FlowGuard — Combined Report</title>"
+        "<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+        "background:#f1f5f9;color:#1e293b;padding:56px 24px;text-align:center}"
+        "a{color:#3730a3;font-weight:700;font-size:18px;text-decoration:none}"
+        ".sub{color:#64748b;font-size:13px;margin-top:10px}</style></head><body>"
+        "<h2>The per-engine dashboards have been consolidated.</h2>"
+        f"<p>Everything now lives in one place — the <a href=\"{href}\">Combined Cross-Engine Report &rarr;</a></p>"
+        f"<p class=\"sub\">Redirecting… if nothing happens, click the link above.</p>"
+        "</body></html>"
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public entry point
@@ -67,12 +96,20 @@ def build(records: list[TestRecord], started_at_ms: int) -> Path:
                                     check_stats=_engine_cs)
 
     _append_trend(stats, decision, started_at_ms, layered)
-    trend = _load_trend()
 
-    html = _render(records, stats, decision, trend, started_at_ms,
-                   health_score=health_score, layered=layered, clusters=clusters,
-                   mobile_findings=_mobile_findings())
+    # Consolidated reporting: the per-engine dashboards are RETIRED in favour of
+    # the single Combined Cross-Engine Report, which now carries the per-engine
+    # detail + dev-actionable evidence. We still run the full pipeline above so
+    # trend-history and the persisted data the combined report reads stay
+    # correct — we just emit a redirect STUB here instead of a duplicate
+    # dashboard. Flip EMIT_FULL_DASHBOARD to restore the legacy per-engine page.
     DASHBOARD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if EMIT_FULL_DASHBOARD:
+        html = _render(records, stats, decision, _load_trend(), started_at_ms,
+                       health_score=health_score, layered=layered, clusters=clusters,
+                       mobile_findings=_mobile_findings())
+    else:
+        html = _redirect_stub_html()
     DASHBOARD_PATH.write_text(html, encoding="utf-8")
     logger.info("[DashboardBuilder] Written → %s", DASHBOARD_PATH)
     return DASHBOARD_PATH
@@ -179,30 +216,31 @@ def _status_badge(status: str) -> str:
     )
 
 
-def _recurring_badge(occurrences: int, window: int, score: float) -> str:
-    """
-    Pill-style recurring-failure badge: '🔁 5/30'. Colour heat-mapped by score.
+# Icon + colour per failure-history label (min-observation classification).
+_LABEL_STYLE = {
+    "NEW":                ("🆕", "#0369a1", "#dbeafe"),
+    "OBSERVED":           ("👁", "#0369a1", "#dbeafe"),
+    "RECURRING":          ("🔁", "#92400e", "#fef3c7"),
+    "FLAKY":              ("⚠️", "#7c3aed", "#ede9fe"),
+    "CONSISTENT_FAILURE": ("🔁", "#b91c1c", "#fee2e2"),
+}
 
-    Score band -> colour:
-      < 0.05      hidden (one-off, not interesting)
-      0.05–0.20   blue   (occasional)
-      0.20–0.50   amber  (recurring, watch)
-      ≥ 0.50      red    (chronic — needs intervention)
+
+def _recurring_badge(occurrences: int, window: int, score: float,
+                     label: str = "NEW") -> str:
+    """Failure-history badge, e.g. '🆕 NEW 1/30' or '🔁 RECURRING 4/30'.
+
+    Classification (not score) decides the word: a failure seen once is NEW,
+    never 'recurring'. Shown for every classified failure so a one-off reads
+    honestly as new rather than as an established pattern.
     """
-    if score < 0.05:
-        return ""
-    color, bg = (
-        ("#b91c1c", "#fee2e2") if score >= 0.50 else
-        ("#92400e", "#fef3c7") if score >= 0.20 else
-        ("#0369a1", "#dbeafe")
-    )
+    icon, color, bg = _LABEL_STYLE.get(label, _LABEL_STYLE["NEW"])
     return (
         f"<span style='display:inline-block;padding:2px 8px;border-radius:9999px;"
         f"font-size:11px;font-weight:700;background:{bg};color:{color};"
         f"margin-left:8px;vertical-align:middle;' "
-        f"title='Recurring failure: seen in {occurrences}/{window} runs "
-        f"(score {score:.2f})'>"
-        f"🔁 {occurrences}/{window}</span>"
+        f"title='{label}: failed in {occurrences}/{window} runs (score {score:.2f})'>"
+        f"{icon} {label} {occurrences}/{window}</span>"
     )
 
 
@@ -516,6 +554,7 @@ def _render_test_rows(
                 cluster.occurrences_in_history,
                 cluster.window_size,
                 cluster.recurring_score,
+                getattr(cluster, "label", "NEW"),
             )
         ai_details = _ai_details_block(r)
         # data-* attributes drive the client-side filter / search / sort.
@@ -1509,15 +1548,20 @@ def _render_recurring_failures_section(clusters) -> str:
     visible = [c for c in clusters if c.recurring_score >= 0.05]
     if not visible:
         return ""
+    # Established patterns (RECURRING/FLAKY/CONSISTENT/OBSERVED) first, NEW last —
+    # so a wall of one-off NEW failures never buries a real recurring bug.
+    _order = {"CONSISTENT_FAILURE": 0, "RECURRING": 1, "FLAKY": 2, "OBSERVED": 3, "NEW": 4}
+    visible = sorted(visible, key=lambda c: (_order.get(getattr(c, "label", "NEW"), 5),
+                                             -c.recurring_score))
+    from collections import Counter
+    counts = Counter(getattr(c, "label", "NEW") for c in visible)
+    summary = " · ".join(f"{n} {lbl.replace('_', ' ').title()}"
+                         for lbl, n in sorted(counts.items(), key=lambda kv: _order.get(kv[0], 5)))
     rows = []
     for c in visible[:20]:  # cap at top 20 to keep the page bounded
-        # Pill colour mirrors _recurring_badge
-        score = c.recurring_score
-        color, bg = (
-            ("#b91c1c", "#fee2e2") if score >= 0.50 else
-            ("#92400e", "#fef3c7") if score >= 0.20 else
-            ("#0369a1", "#dbeafe")
-        )
+        label = getattr(c, "label", "NEW")
+        icon, color, bg = _LABEL_STYLE.get(label, _LABEL_STYLE["NEW"])
+        passes = getattr(c, "passes_in_history", 0)
         rows.append(
             "<tr>"
             f"<td style='padding:6px 12px;font-family:monospace;font-size:12px'>{c.sample_method}</td>"
@@ -1525,8 +1569,10 @@ def _render_recurring_failures_section(clusters) -> str:
             f"<td style='padding:6px 12px;text-align:center;font-size:12px'>"
             f"<span style='display:inline-block;padding:2px 8px;border-radius:9999px;"
             f"font-size:11px;font-weight:700;background:{bg};color:{color}'>"
-            f"{c.occurrences_in_history}/{c.window_size}</span></td>"
-            f"<td style='padding:6px 12px;text-align:right;font-size:12px;color:#64748b'>{score:.2f}</td>"
+            f"{icon} {label.replace('_', ' ')}</span></td>"
+            f"<td style='padding:6px 12px;text-align:center;font-size:12px;color:#64748b'>"
+            f"{c.occurrences_in_history} fail / {passes} pass of {c.runs_seen or c.window_size} runs</td>"
+            f"<td style='padding:6px 12px;text-align:right;font-size:12px;color:#64748b'>{c.recurring_score:.2f}</td>"
             f"<td style='padding:6px 12px;font-size:11px;color:#94a3b8'>{c.last_seen}</td>"
             "</tr>"
         )
@@ -1535,13 +1581,16 @@ def _render_recurring_failures_section(clusters) -> str:
     <div class="dark-surface" style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;
                 padding:18px 22px;margin-bottom:20px;">
       <div style="display:flex;align-items:baseline;justify-content:space-between;
-                  margin-bottom:10px;">
+                  margin-bottom:6px;">
         <div style="font-size:14px;font-weight:700;color:#1e293b;">
-          🔁 Recurring Failures
+          🔁 Failure History
         </div>
         <div style="font-size:11px;color:#64748b;">
-          ranked by recency-weighted score · last {visible[0].window_size} runs
+          last {visible[0].window_size} runs · {summary}
         </div>
+      </div>
+      <div style="font-size:11px;color:#94a3b8;margin-bottom:10px;">
+        NEW = failed once · OBSERVED = twice · RECURRING = 3+ · FLAKY = passes and fails · CONSISTENT = fails ≥90%
       </div>
       <table style="width:100%;border-collapse:collapse;">
         <thead>
@@ -1551,7 +1600,9 @@ def _render_recurring_failures_section(clusters) -> str:
             <th style='padding:6px 12px;text-align:left;font-size:11px;color:#64748b;
                        font-weight:600;text-transform:uppercase;letter-spacing:0.5px'>Feature</th>
             <th style='padding:6px 12px;text-align:center;font-size:11px;color:#64748b;
-                       font-weight:600;text-transform:uppercase;letter-spacing:0.5px'>Runs</th>
+                       font-weight:600;text-transform:uppercase;letter-spacing:0.5px'>Type</th>
+            <th style='padding:6px 12px;text-align:center;font-size:11px;color:#64748b;
+                       font-weight:600;text-transform:uppercase;letter-spacing:0.5px'>History</th>
             <th style='padding:6px 12px;text-align:right;font-size:11px;color:#64748b;
                        font-weight:600;text-transform:uppercase;letter-spacing:0.5px'>Score</th>
             <th style='padding:6px 12px;text-align:left;font-size:11px;color:#64748b;
@@ -1714,6 +1765,26 @@ def _render(
     cluster_html = _render_cluster_section(clusters or [])
     login_routes_html = _render_login_routes_section()
     browser_tabs_html = _render_browser_tabs()
+
+    # Prominent link to the combined cross-engine (Hybrid) report. It always
+    # lives at reports/trend/combined-report.html; compute a relative href from
+    # THIS engine's dashboard location (chromium: sibling; webkit: ../).
+    import os as _os
+    try:
+        _combined_href = _os.path.relpath(
+            Path("reports/trend/combined-report.html"), DASHBOARD_PATH.parent)
+    except Exception:
+        _combined_href = "combined-report.html"
+    combined_banner = (
+        f"<a href='{_combined_href}' class='no-print' "
+        "style='display:block;margin-bottom:20px;padding:12px 18px;border-radius:10px;"
+        "background:linear-gradient(90deg,#eef2ff,#faf5ff);border:1px solid #c7d2fe;"
+        "color:#3730a3;font-weight:700;font-size:14px;text-decoration:none'>"
+        "📊 Open the Combined Cross-Engine Report (Chromium + WebKit, Hybrid layout) &rarr;"
+        "<span style='display:block;font-weight:500;font-size:12px;color:#6366f1;margin-top:2px'>"
+        "This per-engine dashboard shows one engine; the combined report cross-references both with "
+        "provenance, an engine-comparison matrix, and per-section PDF export.</span></a>"
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1898,6 +1969,8 @@ def _render(
       </div>
     </div>
   </div>
+
+  {combined_banner}
 
   <!-- Browser tabs (chromium / firefox / webkit) — only shown when
        multiple per-browser dashboards exist on disk. -->

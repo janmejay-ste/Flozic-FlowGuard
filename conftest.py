@@ -425,6 +425,42 @@ def session_teardown_snapshot(request: pytest.FixtureRequest) -> Iterator[None]:
         pdf_path = build_pdf(records, stats, decision, scores, clusters, started_at)
         logger.info("[session] Report written: %s", pdf_path)
 
+        # ── 5. Combined-report sidecar (report-data.json) ────────────────────
+        # Authoritative per-engine run record for the cross-engine combined
+        # report: persists the scores/decision + the two sections that
+        # otherwise die with the process (login routes, JS error clusters) +
+        # git/env provenance. Never raises into the run.
+        # Only persist a sidecar for a run that actually executed tests. A
+        # total==0 session (e.g. a unit-test run, or a collection-only session)
+        # is EMPTY, not a result, and must not overwrite a real engine record —
+        # the same run-hygiene rule the trend/flake layers follow.
+        if stats["total"] > 0:
+            try:
+                from utils.report_data_sidecar import build_sidecar, write_sidecar
+                from utils.snapshot_writer import SNAPSHOT_PATH as _LIVE_SNAP
+                _payload = build_sidecar(
+                    engine=request.config.getoption("--browser"),
+                    run_started_ms=started_at,
+                    scores=scores,
+                    decision=decision,
+                    stats=stats,
+                    login_routes=_ht.get_login_routes(),
+                    clusters=clusters,
+                )
+                write_sidecar(_LIVE_SNAP.parent, _payload)
+            except Exception as e:
+                logger.warning("[session] report-data sidecar failed (non-fatal): %s", e)
+
+            # Refresh the combined cross-engine report from BOTH engines' latest
+            # persisted data, so it is always current after any run (this engine
+            # fresh + the other engine's last persisted record).
+            try:
+                from utils.combined_report_builder import build as build_combined
+                _cp = build_combined()
+                logger.info("[session] Combined cross-engine report: %s", _cp)
+            except Exception as e:
+                logger.warning("[session] Combined report build failed (non-fatal): %s", e)
+
         _EMAIL_CONTEXT.update(
             stats=stats, decision=decision, scores=scores, records=records,
         )
@@ -738,6 +774,19 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> objec
         or looks_like_connectivity_loss(str(call.excinfo.value))
     ):
         setattr(item, "harness_fault", True)
+
+    # Stash the REAL failure signature (ExceptionType: message). call.excinfo is
+    # the only place the exception itself is available — by teardown, longrepr's
+    # first line is 'self = <TestClass object>', which would cluster failures by
+    # test class rather than by cause. exconly() is class-agnostic, so the same
+    # cause in different test classes shares a signature. Keep the first failing
+    # phase (setup fires before call); never let a teardown error overwrite it.
+    if call.excinfo is not None and rep.failed and not getattr(item, "_error_signature", ""):
+        try:
+            sig = call.excinfo.exconly(tryshort=True)
+        except Exception:
+            sig = str(call.excinfo.value)
+        setattr(item, "_error_signature", " ".join(sig.split())[:300])
     return rep
 
 
@@ -854,6 +903,22 @@ def _record_outcome(
     if _engine != "chromium":
         cohort = f"{cohort}-{_engine}"
 
+    # Failure signature = the exception (ExceptionType: message) stashed by the
+    # makereport hook from call.excinfo. Persisted so SYSTEMIC clustering groups
+    # by CAUSE, not by test class. Fallback: scan longrepr for the pytest 'E '
+    # exception line (NOT line 0, which is 'self = <object>').
+    error_signature = getattr(request.node, "_error_signature", "") or ""
+    if failed and not error_signature:
+        for phase in ("rep_call", "rep_setup"):
+            _r = getattr(request.node, phase, None)
+            if _r is not None and _r.failed and getattr(_r, "longrepr", None):
+                elines = [ln.lstrip("E ").strip()
+                          for ln in str(_r.longrepr).splitlines()
+                          if ln.lstrip().startswith("E ")]
+                if elines:
+                    error_signature = elines[-1][:300]
+                    break
+
     add_test_record(
         category=category,
         login=login,
@@ -866,4 +931,5 @@ def _record_outcome(
         video_path=video_path,
         cohort=cohort,
         harness_fault=bool(getattr(request.node, "harness_fault", False)),
+        error_signature=error_signature,
     )

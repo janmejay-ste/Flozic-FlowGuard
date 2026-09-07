@@ -113,14 +113,13 @@ def _occurrence_from_record(
     method  = record.get("method") or record.get("name") or "<unknown>"
     feat    = record.get("feature", "")
     cat     = record.get("category", "")
-    # The snapshot doesn't store the exception text by design. We use the
-    # test method name + the artifact_folder timestamp as a coarse signal.
-    # The dashboard's ai_triage.json (when present) would give a richer
-    # message, but for cross-run clustering we want a stable signal that's
-    # present in EVERY snapshot — so we stick to the test name + feature.
-    # If two distinct exceptions in the same test happen, they'll cluster
-    # together; that's acceptable for v1.
-    message = f"feature={feat}"
+    # Prefer the persisted failure signature (first line of the assertion /
+    # exception) when the snapshot carries one — that lets two failures that
+    # differ only in dynamic content share a fingerprint. Older snapshots
+    # (pre-signature) have no errorSignature; fall back to the feature name so
+    # they still cluster coarsely rather than not at all.
+    sig = record.get("errorSignature") or ""
+    message = sig if sig else f"feature={feat}"
     return FailureOccurrence(
         run_id=run_id,
         test_method=method,
@@ -179,9 +178,67 @@ class FailureCluster:
     window_size: int = 0          # how many runs were in the window
     recurring_score: float = 0.0  # 0..1, recency-weighted occurrence rate
     sample_message: str = ""
+    # Classification (min-observation rule). A failure seen once is NEW, not
+    # "recurring" — calling a 1/30 failure recurring is exactly the bug this
+    # field fixes. runs_seen / passes_in_history come from the test method's
+    # full pass+fail history and let us distinguish FLAKY from CONSISTENT.
+    runs_seen: int = 0            # runs (in window) where the test method ran at all
+    passes_in_history: int = 0    # runs where the method PASSED
+    label: str = "NEW"            # NEW | OBSERVED | RECURRING | FLAKY | CONSISTENT_FAILURE
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def classify_failure(fail_runs: int, runs_seen: int, passed_runs: int) -> str:
+    """Minimum-observation classification for a failing test.
+
+    1 failure  -> NEW               (a one-off; never call this 'recurring')
+    2 failures -> OBSERVED          (seen twice; still not established)
+    3+ failures:
+        also passed somewhere       -> FLAKY   (mixed pass/fail history)
+        fails >=90% of runs seen    -> CONSISTENT_FAILURE
+        otherwise                   -> RECURRING
+    """
+    if fail_runs <= 1:
+        return "NEW"
+    if fail_runs == 2:
+        return "OBSERVED"
+    if passed_runs >= 1:
+        return "FLAKY"
+    if runs_seen > 0 and fail_runs / runs_seen >= 0.9:
+        return "CONSISTENT_FAILURE"
+    return "RECURRING"
+
+
+def _method_run_stats(snapshot_dir: Path, last_n: int) -> dict[str, dict[str, int]]:
+    """Per test-method appearance stats across the window: how many runs it ran
+    in (seen), passed in, and failed in. Feeds FLAKY vs CONSISTENT_FAILURE."""
+    if not snapshot_dir.exists():
+        return {}
+    files = sorted(snapshot_dir.glob("*.json"), reverse=True)[:last_n]
+    acc: dict[str, dict[str, set]] = {}
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        run_id = f.stem
+        for r in (data.get("tests") or data.get("records") or []):
+            m = r.get("method") or r.get("name")
+            if not m:
+                continue
+            s = acc.setdefault(m, {"seen": set(), "passed": set(), "failed": set()})
+            s["seen"].add(run_id)
+            st = r.get("status")
+            if st == "PASS":
+                s["passed"].add(run_id)
+            elif st == "FAIL":
+                s["failed"].add(run_id)
+    return {
+        m: {"seen": len(v["seen"]), "passed": len(v["passed"]), "failed": len(v["failed"])}
+        for m, v in acc.items()
+    }
 
 
 def _recurring_score(
@@ -249,25 +306,128 @@ def build_clusters(
             entry["run_ids"].append(run_id)
 
     window_size = len(history)
+    mstats = _method_run_stats(snapshot_dir, last_n)
     clusters: list[FailureCluster] = []
     for fp, entry in accum.items():
         indices = entry["indices"]
         run_ids = entry["run_ids"]
+        method = entry["sample_method"]
+        ms = mstats.get(method, {})
+        fail_runs = len(indices)
+        runs_seen = ms.get("seen", fail_runs)
+        passed_runs = ms.get("passed", 0)
         clusters.append(FailureCluster(
             fingerprint=fp,
-            sample_method=entry["sample_method"],
+            sample_method=method,
             sample_feature=entry["sample_feature"],
             sample_message=entry["sample_message"],
             first_seen=run_ids[-1],   # oldest because history is newest-first
             last_seen=run_ids[0],
-            occurrences_in_history=len(indices),
+            occurrences_in_history=fail_runs,
             occurrence_runs=list(reversed(run_ids)),  # chronological
             window_size=window_size,
             recurring_score=_recurring_score(indices, window_size),
+            runs_seen=runs_seen,
+            passes_in_history=passed_runs,
+            label=classify_failure(fail_runs, runs_seen, passed_runs),
         ))
 
     clusters.sort(key=lambda c: c.recurring_score, reverse=True)
     return clusters
+
+
+@dataclass
+class SystemicFailure:
+    """A set of INDEPENDENT failing tests whose NORMALIZED failure signatures
+    match — evidence of one common cause, not merely the same feature.
+
+    Deliberately distinct from two weaker signals (do not conflate them):
+      * Failure Concentration = many failures in the same FEATURE (unproven cause)
+      * Failure Cluster       = failures sharing a normalized signature
+      * Systemic Failure      = a cluster with ENOUGH INDEPENDENT tests to be
+                                high-confidence one cause
+    """
+    signature: str                       # normalized signature (the join key)
+    sample_message: str                  # a representative raw first line
+    affected_tests: int                  # distinct test methods
+    features: int                        # distinct features spanned
+    engines: list[str] = field(default_factory=list)
+    confidence: str = "Low"              # High | Medium | Low
+    test_methods: list[str] = field(default_factory=list)
+    sample_features: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# A signature must be a REAL error line to qualify for systemic detection —
+# never the "feature=" fallback used for pre-signature snapshots, and long
+# enough to be specific rather than generic noise.
+def _is_real_signature(raw: str) -> bool:
+    return bool(raw) and not raw.startswith("feature=") and len(raw.strip()) >= 12
+
+
+def _systemic_confidence(affected_tests: int, features: int) -> str:
+    """Confidence that a matching-signature cluster is ONE systemic cause.
+    Driven by how many INDEPENDENT tests share the signature (and, secondarily,
+    how widely it spreads across features) — NOT by feature membership."""
+    if affected_tests >= 8 or (affected_tests >= 5 and features >= 2):
+        return "High"
+    if affected_tests >= 4:
+        return "Medium"
+    return "Low"
+
+
+def detect_systemic(
+    fail_records: Iterable[dict],
+    min_tests: int = 3,
+) -> list[SystemicFailure]:
+    """Group this run's FAIL records by NORMALIZED signature and return the
+    groups that look systemic: a real (non-fallback) signature shared by at
+    least `min_tests` DISTINCT test methods.
+
+    `fail_records`: dicts with keys method, feature, errorSignature, and
+    (optionally) engine. Records without a real signature are EXCLUDED — a
+    common cause cannot be claimed without matching signatures, which is the
+    rule that keeps this from degenerating back into feature concentration.
+    """
+    groups: dict[str, dict] = {}
+    for r in fail_records:
+        if r.get("status") not in (None, "FAIL"):
+            continue
+        raw = r.get("errorSignature") or ""
+        if not _is_real_signature(raw):
+            continue
+        sig = normalize_message(raw)
+        g = groups.setdefault(sig, {
+            "methods": set(), "features": set(), "engines": set(),
+            "raw_counts": {},
+        })
+        g["methods"].add(r.get("method") or "")
+        if r.get("feature"):
+            g["features"].add(r["feature"])
+        if r.get("engine"):
+            g["engines"].add(r["engine"])
+        g["raw_counts"][raw] = g["raw_counts"].get(raw, 0) + 1
+
+    out: list[SystemicFailure] = []
+    for sig, g in groups.items():
+        methods = {m for m in g["methods"] if m}
+        if len(methods) < min_tests:
+            continue
+        sample = max(g["raw_counts"].items(), key=lambda kv: kv[1])[0] if g["raw_counts"] else sig
+        out.append(SystemicFailure(
+            signature=sig,
+            sample_message=sample,
+            affected_tests=len(methods),
+            features=len(g["features"]),
+            engines=sorted(g["engines"]),
+            confidence=_systemic_confidence(len(methods), len(g["features"])),
+            test_methods=sorted(methods),
+            sample_features=sorted(g["features"]),
+        ))
+    out.sort(key=lambda s: s.affected_tests, reverse=True)
+    return out
 
 
 def cluster_for_test(
