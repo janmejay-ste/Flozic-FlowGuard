@@ -35,7 +35,15 @@ no correlation ID linking a failure to a specific connect/workflow.
 Acceptance: every FAIL folder gains console.json + failure.json; evidence cards show the
 backend-state line; zero new runtime cost (post-processing existing captures at teardown).
 
-## Phase 2 — Playwright tracing (medium; runtime + disk cost)
+## Phase 2 — Playwright tracing (medium; runtime + disk cost) — ✅ IMPLEMENTED 2026-09-07
+Shipped as `utils/trace_store.py` + page-fixture wiring in `conftest.py`. Tracing
+starts per test (screenshots+snapshots+sources), trace.zip is written into the
+evidence folder ONLY on failure and discarded on pass, retention is capped
+newest-N run-wide (`FLOWGUARD_TRACE_MAX`, default 20), gated by `FLOWGUARD_TRACE`
+(default on), and the evidence card links it with the `playwright show-trace`
+command. Report links only, never embeds. 5 unit tests. Design as originally
+specced below.
+
 - `context.tracing.start(screenshots=True, snapshots=True)` per test;
   `stop(path=trace.zip)` **only on failure**, `stop()` discard on pass.
 - Costs: ~5–15% runtime overhead, ~2–10 MB per failing test. Mitigations: cap retained

@@ -598,6 +598,10 @@ def _load_failure_evidence(folder_name: str | None, embed_shot: bool) -> dict:
             ev["backend_state"] = man.get("backend_state") or []
         except (OSError, ValueError):
             pass
+    # Playwright trace (Observability v2 Phase 2) — present only for failures
+    # kept within the run-wide retention cap. Linked, never embedded.
+    if (base / "trace.zip").is_file():
+        ev["trace"] = f"reports/failures/{folder_name}/trace.zip"
     # Network digest — the "did the backend fail?" signal. Captured per failure
     # in network-summary.json but previously never surfaced in the report.
     nsf = base / "network-summary.json"
@@ -683,6 +687,11 @@ def _render_combined_issues(engines: list[EngineData]) -> str:
         if ev.get("connect_id"):
             body.append(f"<div><strong>Connect ID:</strong> "
                         f"<code>{esc(str(ev['connect_id']))}</code></div>")
+        if ev.get("trace"):
+            body.append(
+                f"<div><strong>Trace:</strong> <code>{esc(ev['trace'])}</code> — "
+                "scrub the failure timeline with "
+                f"<code>playwright show-trace {esc(ev['trace'])}</code></div>")
         meta = [f"feature: {esc(r.feature)}", f"engine: {esc(ed.engine)}"]
         if ev.get("url"):
             meta.append(f"page: <a href='{esc(ev['url'])}' target='_blank' rel='noopener'>{esc(ev['url'])}</a>")

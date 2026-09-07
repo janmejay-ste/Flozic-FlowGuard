@@ -591,6 +591,20 @@ def page(
         ctx_kwargs["record_video_size"] = {"width": 1280, "height": 800}
 
     context = browser_instance.new_context(**ctx_kwargs)
+
+    # Observability v2 / Phase 2: Playwright tracing. Started per test, but the
+    # trace is only WRITTEN on failure (discarded on pass in teardown), so
+    # passing tests pay only the in-memory capture. Gated by FLOWGUARD_TRACE
+    # (default on for full runs; set FLOWGUARD_TRACE=0 to disable). Attach is
+    # isolated — a tracing failure never blocks the test.
+    _tracing_on = os.environ.get("FLOWGUARD_TRACE", "1") not in ("0", "false", "False")
+    if _tracing_on:
+        try:
+            context.tracing.start(screenshots=True, snapshots=True, sources=True)
+        except Exception as e:
+            logger.warning("[trace] tracing.start failed; disabled for this test: %s", e)
+            _tracing_on = False
+
     pg = context.new_page()
 
     # Always-on JS monitor — attaches listeners on the blank page before any
@@ -658,6 +672,21 @@ def page(
                 )
             except Exception as e:
                 logger.warning("[failure] manifest write failed (non-fatal): %s", e)
+
+        # Observability v2 / Phase 2: stop tracing while the context is still
+        # alive. Keep the trace ONLY on failure (write trace.zip into the
+        # evidence folder, then prune to the newest N across the run); discard
+        # it on pass so passing tests pay no disk. All isolated — a tracing
+        # failure never masks the test outcome.
+        if _tracing_on:
+            try:
+                if failed and artifact_folder:
+                    from utils.trace_store import save_trace
+                    save_trace(context, Path("reports/failures") / artifact_folder)
+                else:
+                    context.tracing.stop()  # discard
+            except Exception as e:
+                logger.warning("[trace] tracing.stop failed (non-fatal): %s", e)
 
         # Grab the video path BEFORE closing the page — pg.video is only
         # accessible while the page object is alive. After pg.close() the
