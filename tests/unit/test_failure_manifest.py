@@ -76,3 +76,20 @@ def test_write_manifest_survives_corrupt_inputs(tmp_path):
     path = fm.write_failure_manifest(tmp_path, "t", "", None)
     man = json.loads(path.read_text())
     assert man["backend_state"] == [] and man["page_url"] is None
+
+
+def test_write_manifest_accepts_dataclass_console_events(tmp_path):
+    # Regression: real events are utils.js_console_monitor.ConsoleEvent
+    # dataclasses, not dicts. Serializing them directly threw
+    # "Object of type ConsoleEvent is not JSON serializable", which silently
+    # dropped BOTH console.json and failure.json on every live failure.
+    from utils.js_console_monitor import ConsoleEvent
+    events = [ConsoleEvent(type="error", text="CORS blocked", location="x:1:2",
+                           source_origin="media.flozic.ai"),
+              ConsoleEvent(type="log", text="ok")]
+    path = fm.write_failure_manifest(tmp_path, "TestX::t", "sig", events)
+    assert path is not None                                   # did NOT swallow an error
+    man = json.loads(path.read_text())
+    assert man["console"]["errors"] == 1 and man["console"]["total_events"] == 2
+    dumped = json.loads((tmp_path / "console.json").read_text())
+    assert dumped[0]["text"] == "CORS blocked" and dumped[0]["source_origin"] == "media.flozic.ai"

@@ -20,6 +20,7 @@ Deterministic extraction only (no AI), and never raises into a run.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
@@ -28,6 +29,18 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _event_to_dict(e: Any) -> dict:
+    """Normalize a console event to a plain dict. Events arrive as
+    dataclasses (utils.js_console_monitor.ConsoleEvent) at runtime but as
+    dicts in tests/other callers — accept both (and any object with the
+    attrs) so JSON serialization never throws into a run."""
+    if isinstance(e, dict):
+        return e
+    if dataclasses.is_dataclass(e) and not isinstance(e, type):
+        return dataclasses.asdict(e)
+    return {k: getattr(e, k, None) for k in ("type", "text", "location", "source_origin")}
 
 SCHEMA_VERSION = 1
 
@@ -90,7 +103,7 @@ def write_failure_manifest(folder: Path | str, test_name: str,
         if not folder.is_dir():
             return None
 
-        console_events = list(console_events or [])[:500]
+        console_events = [_event_to_dict(e) for e in list(console_events or [])[:500]]
         atomic_write_json(folder / "console.json", console_events)
         console_errors = sum(1 for e in console_events
                              if str(e.get("type", "")).lower() == "error")
