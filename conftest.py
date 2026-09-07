@@ -274,6 +274,13 @@ def _retarget_report_paths(config: pytest.Config) -> Path:
     _db.DASHBOARD_PATH = root / "dashboard.html"
     _db.TREND_JSON     = root / "trend-history.json"
 
+    # failure_clustering.SNAPSHOT_DIR — the cross-run clustering READER. Must
+    # match where session_teardown archives this engine's snapshots
+    # (<live snapshot>.parent/snapshots); leaving it at the chromium default
+    # had WebKit runs clustering against Chromium's history.
+    import utils.failure_clustering as _fc
+    _fc.SNAPSHOT_DIR = root / "snapshots"
+
     # pdf_report_builder writes report-printable.html / .pdf into the
     # same trend folder — repoint if it exposes a path constant too.
     try:
