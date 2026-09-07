@@ -150,16 +150,23 @@ def load_history(
         snapshot_dir = SNAPSHOT_DIR
     if not snapshot_dir.exists():
         return []
-    files = sorted(snapshot_dir.glob("*.json"), reverse=True)[:last_n]
     out: list[tuple[str, list[FailureOccurrence]]] = []
-    for f in files:
+    # Walk newest-first and keep the first `last_n` COMPLETED runs. EMPTY
+    # sessions (unit-only / aborted, 0 tests) are NOT runs: counting them in
+    # the window inflated the '/30' denominator — the audit found 28 of 30
+    # entries were 0/0 junk — and made one-off failures look 'recent-heavy'.
+    for f in sorted(snapshot_dir.glob("*.json"), reverse=True):
+        if len(out) >= last_n:
+            break
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
         except Exception as e:
             logger.warning("Could not read snapshot %s: %s", f, e)
             continue
-        run_id = f.stem
         records = data.get("tests") or data.get("records") or []
+        if data.get("runStatus") == "EMPTY" or not records:
+            continue
+        run_id = f.stem
         occurrences = [
             o for o in (_occurrence_from_record(run_id, r) for r in records)
             if o is not None
@@ -223,15 +230,23 @@ def _method_run_stats(snapshot_dir: Path, last_n: int) -> dict[str, dict[str, in
     in (seen), passed in, and failed in. Feeds FLAKY vs CONSISTENT_FAILURE."""
     if not snapshot_dir.exists():
         return {}
-    files = sorted(snapshot_dir.glob("*.json"), reverse=True)[:last_n]
     acc: dict[str, dict[str, set]] = {}
-    for f in files:
+    used = 0
+    # Same COMPLETED-only window as load_history, so pass/fail rates and the
+    # recurring window share one denominator.
+    for f in sorted(snapshot_dir.glob("*.json"), reverse=True):
+        if used >= last_n:
+            break
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
         except Exception:
             continue
+        records = data.get("tests") or data.get("records") or []
+        if data.get("runStatus") == "EMPTY" or not records:
+            continue
+        used += 1
         run_id = f.stem
-        for r in (data.get("tests") or data.get("records") or []):
+        for r in records:
             m = r.get("method") or r.get("name")
             if not m:
                 continue

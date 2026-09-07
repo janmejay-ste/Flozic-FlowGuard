@@ -147,6 +147,10 @@ def write_snapshot(target: Path = SNAPSHOT_PATH) -> Path:
         },
     }
 
+    # Run-execution status so history readers (trend, flake window) can skip
+    # EMPTY sessions instead of counting them as runs.
+    from utils.report_data_sidecar import classify_execution
+    payload["runStatus"] = classify_execution(len(records))
     # Atomic swap — snapshots are read cross-engine by the combined report
     # while parallel runs may still be writing.
     from utils.atomic_io import atomic_write_json

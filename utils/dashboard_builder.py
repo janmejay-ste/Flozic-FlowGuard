@@ -165,10 +165,15 @@ def _append_trend(stats: dict, decision: Any, started_at_ms: int,
         except Exception:
             history = []
 
+    # Run-execution status (COMPLETED / EMPTY): a unit-only or aborted session
+    # that executed 0 tests is NOT a test result — trend charts and the
+    # flake window must be able to exclude it instead of averaging in 0/0 junk.
+    from utils.report_data_sidecar import classify_execution
     history.append({
         "ts":        started_at_ms,
         "label":     datetime.fromtimestamp(started_at_ms / 1000, tz=timezone.utc)
                               .strftime("%Y-%m-%d %H:%M UTC"),
+        "run_status": classify_execution(stats["total"]),
         "total":     stats["total"],
         "passed":    stats["passed"],
         "failed":    stats["failed"],
@@ -1636,6 +1641,11 @@ def _render_feature_rows(by_feature: dict) -> str:
 
 
 def _render_trend_rows(trend: list[dict]) -> str:
+    # Run history shows EXECUTED runs only. An EMPTY session (0 tests — unit-only
+    # or aborted) is an audit-trail row, not a test result; mixing them in made
+    # the history read as a wall of 0/0 WARNING junk.
+    trend = [r for r in trend
+             if r.get("run_status", "COMPLETED") == "COMPLETED" and (r.get("total") or 0) > 0]
     if not trend:
         return "<tr><td colspan='5' style='text-align:center;color:#94a3b8;padding:20px'>No trend data yet</td></tr>"
     rows = []
