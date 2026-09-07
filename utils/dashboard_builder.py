@@ -76,6 +76,7 @@ def build(records: list[TestRecord], started_at_ms: int) -> Path:
         failed       = stats["failed"],
         smoke_total  = stats["smoke_total"],
         smoke_passed = stats["smoke_passed"],
+        harness_faults = stats["harness_faults"],
     )
 
     # Health score + layered domain scores
@@ -135,9 +136,14 @@ def _compute_stats(records: list[TestRecord]) -> dict[str, Any]:
         entry[r.status.lower() if r.status.lower() in ("pass","fail","skip") else "skip"] += 1
 
     total_ms = sum(r.duration_ms for r in records)
+    # Failures attributed to the harness/infrastructure (connectivity loss,
+    # missing env) — the release gate excludes them from the product fail-rate.
+    harness_faults = sum(1 for r in records
+                         if r.status == "FAIL" and getattr(r, "harness_fault", False))
     return dict(
         total=total, passed=passed, failed=failed, skipped=skipped,
         smoke_total=smoke_total, smoke_passed=smoke_passed,
+        harness_faults=harness_faults,
         pass_rate=round(passed / total * 100, 1) if total else 0,
         by_feature=by_feature,
         total_ms=total_ms,

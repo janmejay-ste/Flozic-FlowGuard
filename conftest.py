@@ -375,6 +375,7 @@ def session_teardown_snapshot(request: pytest.FixtureRequest) -> Iterator[None]:
             failed       = stats["failed"],
             smoke_total  = stats["smoke_total"],
             smoke_passed = stats["smoke_passed"],
+            harness_faults = stats["harness_faults"],
         )
 
         clusters = _ht.get_clusters()
