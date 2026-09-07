@@ -587,6 +587,17 @@ def _load_failure_evidence(folder_name: str | None, embed_shot: bool) -> dict:
             ev["url"] = u.read_text(encoding="utf-8").strip()[:400]
         except OSError:
             pass
+    # failure.json (Observability v2): connect id, console error count, and the
+    # backend's last relevant API responses extracted from captured traffic.
+    fm = base / "failure.json"
+    if fm.is_file():
+        try:
+            man = json.loads(fm.read_text(encoding="utf-8"))
+            ev["connect_id"] = man.get("connect_id")
+            ev["console_errors"] = (man.get("console") or {}).get("errors")
+            ev["backend_state"] = man.get("backend_state") or []
+        except (OSError, ValueError):
+            pass
     # Network digest — the "did the backend fail?" signal. Captured per failure
     # in network-summary.json but previously never surfaced in the report.
     nsf = base / "network-summary.json"
@@ -655,6 +666,23 @@ def _render_combined_issues(engines: list[EngineData]) -> str:
                 f"<div><strong>Network during test:</strong> {n['failed']}/{n['total']} "
                 f"requests failed ({esc(bad)}) — full request/response bodies in the "
                 "failure folder's network-events.json.</div>")
+        # Backend state at failure (Observability v2): the last relevant API
+        # response — the line that separates backend stalls from frontend bugs.
+        if ev.get("backend_state"):
+            last = ev["backend_state"][-1]
+            excerpt = (last.get("body_excerpt") or "").strip()
+            body.append(
+                f"<div><strong>Backend at failure:</strong> "
+                f"<code>{esc(str(last.get('endpoint','')))[:80]}</code> → "
+                f"{esc(str(last.get('status') or last.get('failure_reason') or '?'))}"
+                + (f" · <code>{esc(excerpt[:140])}</code>" if excerpt else "")
+                + "</div>")
+        if ev.get("console_errors") is not None:
+            body.append(f"<div><strong>Console:</strong> {ev['console_errors']} "
+                        "error(s) during the test (console.json in the evidence folder).</div>")
+        if ev.get("connect_id"):
+            body.append(f"<div><strong>Connect ID:</strong> "
+                        f"<code>{esc(str(ev['connect_id']))}</code></div>")
         meta = [f"feature: {esc(r.feature)}", f"engine: {esc(ed.engine)}"]
         if ev.get("url"):
             meta.append(f"page: <a href='{esc(ev['url'])}' target='_blank' rel='noopener'>{esc(ev['url'])}</a>")

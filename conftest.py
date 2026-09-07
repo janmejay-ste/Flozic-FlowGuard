@@ -644,6 +644,21 @@ def page(
             except Exception as e:
                 logger.warning("AI triage failed (non-fatal): %s", e)
 
+            # Observability v2 / Phase 1: per-failure console.json + failure.json
+            # (error signature, connect id from the editor URL, and the backend's
+            # last relevant API responses extracted from the traffic we already
+            # captured). Deterministic; never raises into the run.
+            try:
+                from utils.failure_manifest import write_failure_manifest
+                write_failure_manifest(
+                    Path("reports/failures") / artifact_folder,
+                    test_name=test_name,
+                    error_signature=getattr(request.node, "_error_signature", "") or "",
+                    console_events=list(_page_monitor.events),
+                )
+            except Exception as e:
+                logger.warning("[failure] manifest write failed (non-fatal): %s", e)
+
         # Grab the video path BEFORE closing the page — pg.video is only
         # accessible while the page object is alive. After pg.close() the
         # video file is finalised by Playwright on disk.
