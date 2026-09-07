@@ -29,3 +29,8 @@ anthropic>=0.40.0           # verified 0.120.2
 # report-printable.html and logs a skip — nothing fails.
 # Needs GTK+ on Windows; see docs/pdf-setup.md
 # weasyprint>=62.3
+
+# FlowGuard MCP server (flowguard_mcp.py) — read-only conversational access to
+# run results for MCP clients (Claude Code etc.). The test framework itself
+# never imports it; only the server entrypoint does. SDK 2.x (MCPServer API).
+mcp>=2.1

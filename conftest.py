@@ -274,6 +274,13 @@ def _retarget_report_paths(config: pytest.Config) -> Path:
     _db.DASHBOARD_PATH = root / "dashboard.html"
     _db.TREND_JSON     = root / "trend-history.json"
 
+    # failure_clustering.SNAPSHOT_DIR — the cross-run clustering READER. Must
+    # match where session_teardown archives this engine's snapshots
+    # (<live snapshot>.parent/snapshots); leaving it at the chromium default
+    # had WebKit runs clustering against Chromium's history.
+    import utils.failure_clustering as _fc
+    _fc.SNAPSHOT_DIR = root / "snapshots"
+
     # pdf_report_builder writes report-printable.html / .pdf into the
     # same trend folder — repoint if it exposes a path constant too.
     try:
@@ -368,6 +375,7 @@ def session_teardown_snapshot(request: pytest.FixtureRequest) -> Iterator[None]:
             failed       = stats["failed"],
             smoke_total  = stats["smoke_total"],
             smoke_passed = stats["smoke_passed"],
+            harness_faults = stats["harness_faults"],
         )
 
         clusters = _ht.get_clusters()
@@ -583,6 +591,20 @@ def page(
         ctx_kwargs["record_video_size"] = {"width": 1280, "height": 800}
 
     context = browser_instance.new_context(**ctx_kwargs)
+
+    # Observability v2 / Phase 2: Playwright tracing. Started per test, but the
+    # trace is only WRITTEN on failure (discarded on pass in teardown), so
+    # passing tests pay only the in-memory capture. Gated by FLOWGUARD_TRACE
+    # (default on for full runs; set FLOWGUARD_TRACE=0 to disable). Attach is
+    # isolated — a tracing failure never blocks the test.
+    _tracing_on = os.environ.get("FLOWGUARD_TRACE", "1") not in ("0", "false", "False")
+    if _tracing_on:
+        try:
+            context.tracing.start(screenshots=True, snapshots=True, sources=True)
+        except Exception as e:
+            logger.warning("[trace] tracing.start failed; disabled for this test: %s", e)
+            _tracing_on = False
+
     pg = context.new_page()
 
     # Always-on JS monitor — attaches listeners on the blank page before any
@@ -635,6 +657,36 @@ def page(
                 )
             except Exception as e:
                 logger.warning("AI triage failed (non-fatal): %s", e)
+
+            # Observability v2 / Phase 1: per-failure console.json + failure.json
+            # (error signature, connect id from the editor URL, and the backend's
+            # last relevant API responses extracted from the traffic we already
+            # captured). Deterministic; never raises into the run.
+            try:
+                from utils.failure_manifest import write_failure_manifest
+                write_failure_manifest(
+                    Path("reports/failures") / artifact_folder,
+                    test_name=test_name,
+                    error_signature=getattr(request.node, "_error_signature", "") or "",
+                    console_events=list(_page_monitor.events),
+                )
+            except Exception as e:
+                logger.warning("[failure] manifest write failed (non-fatal): %s", e)
+
+        # Observability v2 / Phase 2: stop tracing while the context is still
+        # alive. Keep the trace ONLY on failure (write trace.zip into the
+        # evidence folder, then prune to the newest N across the run); discard
+        # it on pass so passing tests pay no disk. All isolated — a tracing
+        # failure never masks the test outcome.
+        if _tracing_on:
+            try:
+                if failed and artifact_folder:
+                    from utils.trace_store import save_trace
+                    save_trace(context, Path("reports/failures") / artifact_folder)
+                else:
+                    context.tracing.stop()  # discard
+            except Exception as e:
+                logger.warning("[trace] tracing.stop failed (non-fatal): %s", e)
 
         # Grab the video path BEFORE closing the page — pg.video is only
         # accessible while the page object is alive. After pg.close() the

@@ -13,8 +13,11 @@ failure_clustering.py would consume).
 """
 import html
 import json
+import logging
 import os
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 
 # Session-wide accumulator so layered_health_scores can see mobile findings.
@@ -164,15 +167,33 @@ class MobileReportCollector:
 
     def write_summary(self, base="reports/trend") -> str:
         path = self.summary_path(base)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as fh:
-            json.dump({"schema_version": 1, **self.summary(),
-                       # Additive: {attempted, executed} for THIS engine, so
-                       # cross-engine readers can show "% executed" without
-                       # mistaking untested checks for clean ones. None when
-                       # nothing was instrumented (e.g. layout-only sessions).
-                       "check_stats": session_check_stats().get(self.engine),
-                       "findings": self._sorted_findings()}, fh, indent=2)
+        new_stats = session_check_stats().get(self.engine)
+        # Clobber guard: a layout-only SUBSET session has no check_stats. It
+        # must not overwrite an INSTRUMENTED summary from a full mobile run —
+        # that swap silently replaced the real mobile view with a page-slice
+        # more than once. Uninstrumented may replace uninstrumented (or nothing);
+        # instrumented always writes (it IS the fresher full view).
+        if new_stats is None and os.path.isfile(path):
+            try:
+                with open(path) as fh:
+                    if json.load(fh).get("check_stats") is not None:
+                        logger.info(
+                            "[mobile-summary] kept instrumented summary at %s — this "
+                            "session ran an uninstrumented subset and does not replace it.",
+                            path)
+                        return path
+            except (OSError, ValueError):
+                pass  # unreadable existing file: overwrite it
+        # Atomic: the OTHER engine's parallel teardown reads this file to build
+        # the combined report — it must never observe a half-written summary.
+        from utils.atomic_io import atomic_write_json
+        atomic_write_json(path, {"schema_version": 1, **self.summary(),
+                                 # Additive: {attempted, executed} for THIS engine, so
+                                 # cross-engine readers can show "% executed" without
+                                 # mistaking untested checks for clean ones. None when
+                                 # nothing was instrumented (e.g. layout-only sessions).
+                                 "check_stats": new_stats,
+                                 "findings": self._sorted_findings()})
         return path
 
     def report_dir(self, base="reports/mobile") -> str:

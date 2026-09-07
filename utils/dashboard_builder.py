@@ -76,6 +76,7 @@ def build(records: list[TestRecord], started_at_ms: int) -> Path:
         failed       = stats["failed"],
         smoke_total  = stats["smoke_total"],
         smoke_passed = stats["smoke_passed"],
+        harness_faults = stats["harness_faults"],
     )
 
     # Health score + layered domain scores
@@ -135,9 +136,14 @@ def _compute_stats(records: list[TestRecord]) -> dict[str, Any]:
         entry[r.status.lower() if r.status.lower() in ("pass","fail","skip") else "skip"] += 1
 
     total_ms = sum(r.duration_ms for r in records)
+    # Failures attributed to the harness/infrastructure (connectivity loss,
+    # missing env) — the release gate excludes them from the product fail-rate.
+    harness_faults = sum(1 for r in records
+                         if r.status == "FAIL" and getattr(r, "harness_fault", False))
     return dict(
         total=total, passed=passed, failed=failed, skipped=skipped,
         smoke_total=smoke_total, smoke_passed=smoke_passed,
+        harness_faults=harness_faults,
         pass_rate=round(passed / total * 100, 1) if total else 0,
         by_feature=by_feature,
         total_ms=total_ms,
@@ -165,10 +171,15 @@ def _append_trend(stats: dict, decision: Any, started_at_ms: int,
         except Exception:
             history = []
 
+    # Run-execution status (COMPLETED / EMPTY): a unit-only or aborted session
+    # that executed 0 tests is NOT a test result — trend charts and the
+    # flake window must be able to exclude it instead of averaging in 0/0 junk.
+    from utils.report_data_sidecar import classify_execution
     history.append({
         "ts":        started_at_ms,
         "label":     datetime.fromtimestamp(started_at_ms / 1000, tz=timezone.utc)
                               .strftime("%Y-%m-%d %H:%M UTC"),
+        "run_status": classify_execution(stats["total"]),
         "total":     stats["total"],
         "passed":    stats["passed"],
         "failed":    stats["failed"],
@@ -182,8 +193,10 @@ def _append_trend(stats: dict, decision: Any, started_at_ms: int,
 
     # Keep last 30 runs
     history = history[-30:]
-    TREND_JSON.parent.mkdir(parents=True, exist_ok=True)
-    TREND_JSON.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    # Atomic: the other engine's parallel rebuild reads this trend file for the
+    # authoritative overall/mobile scores — never let it see a partial write.
+    from utils.atomic_io import atomic_write_json
+    atomic_write_json(TREND_JSON, history)
 
 
 def _load_trend() -> list[dict]:
@@ -1634,6 +1647,11 @@ def _render_feature_rows(by_feature: dict) -> str:
 
 
 def _render_trend_rows(trend: list[dict]) -> str:
+    # Run history shows EXECUTED runs only. An EMPTY session (0 tests — unit-only
+    # or aborted) is an audit-trail row, not a test result; mixing them in made
+    # the history read as a wall of 0/0 WARNING junk.
+    trend = [r for r in trend
+             if r.get("run_status", "COMPLETED") == "COMPLETED" and (r.get("total") or 0) > 0]
     if not trend:
         return "<tr><td colspan='5' style='text-align:center;color:#94a3b8;padding:20px'>No trend data yet</td></tr>"
     rows = []

@@ -86,12 +86,14 @@ def _engine_root(engine: str, base: str) -> str:
     return base if engine == "chromium" else os.path.join(base, engine)
 
 
-def _load_trend_auth(root: str) -> dict | None:
-    """Latest COMPLETED (total>0) trend-history row for this engine — the
-    AUTHORITATIVE overall/mobile/status the real run computed in-session.
-    We read these rather than recompute, because Product/Infra/Framework
-    health depend on in-session JS ErrorClusters that snapshots don't persist,
-    so a recompute would silently disagree with the real dashboard.
+def _load_trend_auth(root: str, anchor_ms: int | None = None) -> dict | None:
+    """AUTHORITATIVE overall/mobile/status row from trend history — read, never
+    recomputed (Product/Infra/Framework depend on in-session JS ErrorClusters
+    that snapshots don't persist).
+
+    When anchor_ms is given (the full-suite sidecar's run start), the row for
+    THAT run is preferred, so a later subset run's row cannot displace the
+    full-run scores. Falls back to the latest total>0 row.
     """
     path = os.path.join(root, "trend-history.json")
     try:
@@ -100,6 +102,10 @@ def _load_trend_auth(root: str) -> dict | None:
         return None
     rows = rows if isinstance(rows, list) else rows.get("entries", [])
     good = [r for r in rows if (r.get("total") or 0) > 0]
+    if anchor_ms:
+        anchored = next((r for r in good if r.get("ts") == anchor_ms), None)
+        if anchored:
+            return anchored
     return good[-1] if good else None
 
 
@@ -135,13 +141,33 @@ def load_engine(engine: str, base: str = "reports/trend") -> EngineData:
     root = _engine_root(engine, base)
     ed = EngineData(engine=engine)
 
-    # Pick the latest NON-EMPTY snapshot. A pytest session always archives a
-    # snapshot at teardown — including unit-only runs that executed 0 browser
-    # tests — so the newest file on disk may be an EMPTY run. Reading that would
-    # wipe this engine's data in the report; skip EMPTY snapshots (same
-    # run-hygiene rule the trend/flake layers follow).
+    # Sidecar first: report-data.json is written ONLY by full-suite runs (a
+    # partial run writes report-data-partial.json), so it names the ANCHOR RUN
+    # this engine's view is built from. Fall back to the partial sidecar when
+    # no full run has ever been recorded.
+    ed.sidecar = None
+    for name in ("report-data.json", "report-data-partial.json"):
+        p = os.path.join(root, name)
+        if os.path.isfile(p):
+            try:
+                ed.sidecar = json.load(open(p, encoding="utf-8"))
+                break
+            except (OSError, ValueError):
+                continue
+    anchor_ms = (ed.sidecar or {}).get("run_started_at")
+
+    # Snapshot: prefer the one belonging to the ANCHOR run (archive stems are
+    # the run's start time), so tiles/failures/evidence describe the same run
+    # as the health scores — a later subset run cannot desync them. Fall back
+    # to the latest NON-EMPTY snapshot (a pytest session always archives one,
+    # including unit-only sessions, so the newest file may be EMPTY junk).
     snaps = sorted(glob.glob(os.path.join(root, "snapshots", "*.json")), key=os.path.getmtime)
-    for snap in reversed(snaps):
+    anchor_snap = None
+    if anchor_ms:
+        stem = datetime.fromtimestamp(anchor_ms / 1000).strftime("%Y%m%d_%H%M%S")
+        anchor_snap = next((s for s in snaps if os.path.basename(s).startswith(stem)), None)
+    ordered = ([anchor_snap] if anchor_snap else []) + list(reversed(snaps))
+    for snap in ordered:
         recs, run_ms = _records_from_snapshot(snap)
         if recs:
             ed.snapshot_path, ed.records, ed.run_ms, ed.present = snap, recs, run_ms, True
@@ -151,6 +177,8 @@ def load_engine(engine: str, base: str = "reports/trend") -> EngineData:
             ed.snapshot_path = snaps[-1]
             _, ed.run_ms = _records_from_snapshot(snaps[-1])
 
+    # Mobile summary is deliberately NOT anchored: a fresh mobile-only run
+    # legitimately refreshes it, and it carries its own generated_at provenance.
     ms_path = os.path.join(root, "mobile-summary.json")
     if os.path.isfile(ms_path):
         try:
@@ -158,14 +186,7 @@ def load_engine(engine: str, base: str = "reports/trend") -> EngineData:
         except (OSError, ValueError):
             ed.mobile = None
 
-    sc_path = os.path.join(root, "report-data.json")
-    if os.path.isfile(sc_path):
-        try:
-            ed.sidecar = json.load(open(sc_path, encoding="utf-8"))
-        except (OSError, ValueError):
-            ed.sidecar = None
-
-    ed.auth = _load_trend_auth(root)
+    ed.auth = _load_trend_auth(root, anchor_ms=anchor_ms)
 
     # Recompute layered scores from what we have (records + mobile findings/coverage).
     if ed.present:
@@ -566,6 +587,21 @@ def _load_failure_evidence(folder_name: str | None, embed_shot: bool) -> dict:
             ev["url"] = u.read_text(encoding="utf-8").strip()[:400]
         except OSError:
             pass
+    # failure.json (Observability v2): connect id, console error count, and the
+    # backend's last relevant API responses extracted from captured traffic.
+    fm = base / "failure.json"
+    if fm.is_file():
+        try:
+            man = json.loads(fm.read_text(encoding="utf-8"))
+            ev["connect_id"] = man.get("connect_id")
+            ev["console_errors"] = (man.get("console") or {}).get("errors")
+            ev["backend_state"] = man.get("backend_state") or []
+        except (OSError, ValueError):
+            pass
+    # Playwright trace (Observability v2 Phase 2) — present only for failures
+    # kept within the run-wide retention cap. Linked, never embedded.
+    if (base / "trace.zip").is_file():
+        ev["trace"] = f"reports/failures/{folder_name}/trace.zip"
     # Network digest — the "did the backend fail?" signal. Captured per failure
     # in network-summary.json but previously never surfaced in the report.
     nsf = base / "network-summary.json"
@@ -634,6 +670,28 @@ def _render_combined_issues(engines: list[EngineData]) -> str:
                 f"<div><strong>Network during test:</strong> {n['failed']}/{n['total']} "
                 f"requests failed ({esc(bad)}) — full request/response bodies in the "
                 "failure folder's network-events.json.</div>")
+        # Backend state at failure (Observability v2): the last relevant API
+        # response — the line that separates backend stalls from frontend bugs.
+        if ev.get("backend_state"):
+            last = ev["backend_state"][-1]
+            excerpt = (last.get("body_excerpt") or "").strip()
+            body.append(
+                f"<div><strong>Backend at failure:</strong> "
+                f"<code>{esc(str(last.get('endpoint','')))[:80]}</code> → "
+                f"{esc(str(last.get('status') or last.get('failure_reason') or '?'))}"
+                + (f" · <code>{esc(excerpt[:140])}</code>" if excerpt else "")
+                + "</div>")
+        if ev.get("console_errors") is not None:
+            body.append(f"<div><strong>Console:</strong> {ev['console_errors']} "
+                        "error(s) during the test (console.json in the evidence folder).</div>")
+        if ev.get("connect_id"):
+            body.append(f"<div><strong>Connect ID:</strong> "
+                        f"<code>{esc(str(ev['connect_id']))}</code></div>")
+        if ev.get("trace"):
+            body.append(
+                f"<div><strong>Trace:</strong> <code>{esc(ev['trace'])}</code> — "
+                "scrub the failure timeline with "
+                f"<code>playwright show-trace {esc(ev['trace'])}</code></div>")
         meta = [f"feature: {esc(r.feature)}", f"engine: {esc(ed.engine)}"]
         if ev.get("url"):
             meta.append(f"page: <a href='{esc(ev['url'])}' target='_blank' rel='noopener'>{esc(ev['url'])}</a>")
@@ -1458,13 +1516,18 @@ def build(base: str = "reports/trend", out: Path | str = OUT_PATH) -> Path:
 <script>{_JS}</script>
 </body></html>"""
 
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(html, encoding="utf-8")
+    # Atomic swaps: two parallel teardowns may rebuild concurrently, and a
+    # browser may refresh mid-write — readers must always see a complete page.
+    # Note the rebuild is INCREMENTAL by design: it re-reads BOTH engines'
+    # persisted data every time, so engine B's rebuild carries engine A's
+    # completed results forward — it can never erase them.
+    from utils.atomic_io import atomic_write_text
+    atomic_write_text(out, html)
     # Also write index.html so the combined report is the DEFAULT landing page:
     # opening reports/trend/ (or the server root) now lands on the cross-engine
     # view rather than a per-engine dashboard.
     try:
-        (out.parent / "index.html").write_text(html, encoding="utf-8")
+        atomic_write_text(out.parent / "index.html", html)
     except Exception:
         pass
     return out
